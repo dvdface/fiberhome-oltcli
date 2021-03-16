@@ -4,6 +4,8 @@ from typing import NoReturn
 from telnetlib import Telnet
 import logging
 
+logger = logging.getLogger(__name__)
+
 class Connection(ABC):
     """Connection Class
     
@@ -44,6 +46,10 @@ class Connection(ABC):
         """
         pass
 
+    def __del__(self):
+        """disconnect when free
+        """
+        self.disconnect()
 
 class OLTTelnet(Connection):
     """OLT Telnet
@@ -152,60 +158,23 @@ class OLTTelnet(Connection):
             data = self._telnet.read_until(b"# ", self._read_interval).decode("ascii")
             output_data.append(data)
             
-            # 这里是为了解决执行pingonu命令时，telnet卡住的问题
-            # 每当读到round-trip(ms) min/avg/max信息时，发送回车，解决卡住不输出的问题
-            if("round-trip(ms) min/avg/max" in data):
-                self._telnet.write("\r\n".encode("ascii"))
-                continue
+            # if read end symbols, break
+            if("# " in data \
+                or "User> " in data \
+                or "Login: " in data \
+                or "Password: " in data):
+                break
 
-            # 如果开启了特殊读取模式，则连续两次没有读到数据，退出循环
-            if sepcial_end_mode and len(output_data) >= 2:
-                if output_data[-1] == "" \
-                    and output_data[-2] == "":
-                    break
-            else:
-                # 否则，要读到提示符出现为止
-                if("# " in data \
-                    or "User> " in data \
-                    or "Login: " in data \
-                    or "Password: " in data):
-                    break
-
-        # 对输出数据中的特殊字符处理
-        output = "".join(output_data)
-        output = output.replace("--Press any key to continue Ctrl+c to stop--", "")
-        output = output.replace("\x08", "")
-        output = output.replace(" " * 48, "")  # remove empty line
-
-        # 去掉输出数据中的ansi escape sequence
-        # ansi escape sequence: https://en.wikipedia.org/wiki/ANSI_escape_code
-        output = output.replace("\x1b[19;05H                       ", "")
-        output = output.replace("\r\n   \x1b[2J", "")
-        output = output.replace("\x1b[2J" ,"")
-
-
-        logging.getLogger().info(output)
-
-        # 去掉输出数据中的第一行(输入命令)和最后一行(提示符）
-        data_without_inputcmd_and_prompt = output.split("\r\n")[1:-1]
-
-        # 将输出数据使用回车换行连接成长字符串
-        ret = "\r\n".join(data_without_inputcmd_and_prompt)
-
-        # 检查输出结果中不应该存在命令执行失败的提示。
-        if ret.find("Command executes failed.") != -1:
-            logging.getLogger().debug(output)
-            raise RuntimeWarning("命令'%s'执行结果中包含'Command executes failed.'" % cmd)
-
-        if ret.find("% Unknown command.") != -1:
-            logging.getLogger().debug(output)
-            raise RuntimeWarning("命令'%s'执行结果中包含'% Unknown command.'" % cmd)
+        raw_output = "".join(output_data)
+        output = raw_output.split("\r\n")[1:-1]
+        ret = "\r\n".join(output)
+        logger.debug(ret)
 
         return ret
 
-
 __all__ = [
 
-    'Connection'
+    'Connection',
+    'OLTTelnet'
 ]
 

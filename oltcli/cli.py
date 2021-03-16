@@ -1,19 +1,152 @@
 '''
-这里是AN6000-17型号OLT的OLTCLI实现模块
+AN6000系列OLT命令行接口封装类
 '''
 
 from datetime import time
+from typing import Any, NoReturn, Optional, Tuple, Union, List
 from dateutil.parser import parse
 
 import re
 import logging
 import time
+from enum import Enum
+from wait import wait_for_true
 
-from ..utils import value, validate_type, run_by_thread_pool, list_to_str, validate_key, wait_for_true, validate_int_range, len_of_mask
-from .common import *
-from ..conn import Connection
+from .utils import auto_convert, run_by_thread_pool, list_to_str, validate_key, len_of_mask
+from .telnet import OLTTelnet
 
+class IGMPMode(Enum):
+    """所有支持的IGMP模式
+    """
+    control = 'control' # 可控模式
+    proxy_proxy = 'proxy-proxy' # 代理-代理模式
+    snooping = 'snooping' # 侦听模式
+    proxy_snooping = 'proxy-snooping' # 代理-侦听模式
+    disable = 'disable' # 关闭模式
 
+class DhcpOption(Enum):
+    """用于dhcp option18/37/82或patch enable/disable命令
+    """
+    option18 = 'option18'
+    option37 = 'option37'
+    option82 = 'option82'
+    patch = 'patch'
+
+class WhitelistMode(Enum):
+    """whitelist add命令所支持的所有授权模式
+    """
+    phyid = 'phy-id'
+    phyid_psw = 'phy-id+psw'
+    logid = 'log-id'
+    logid_psw = 'log-id+psw'
+    password = 'password'
+
+def get_whitelist_query_str(wlMode):
+    """根据WhitelistMode的类型，返回对应的查询白名单的字符
+    
+    Args:
+        wlMode (WhitelistMode): 白名单模式
+    """
+    if wlMode in [ WhitelistMode.phyid, WhitelistMode.phyid_psw ]:
+        return 'phy-id'
+
+    if wlMode in [ WhitelistMode.logid, WhitelistMode.logid_psw ]:
+        return 'logic-id'
+    
+    if wlMode in [ WhitelistMode.password ]:
+        return 'password'
+
+class AuthMode(Enum):
+    """用于port authentication-mode <mode>命令，设置授权模式
+    """
+    logid = 'log-id'
+    logid_psw = 'log-id+psw'
+    no_auth = 'no-auth'
+    password = 'password'
+    phyid_psw = 'phy-id+psw'
+    phyid_o_logid_psw_o_psw = 'phy-id/log-id+psw/psw'
+    phyid_o_logid_o_psw = 'phy-id/log-id/psw'
+    phyid_o_psw = 'phy-id/psw'
+    phyid = 'phyid'
+
+class WanMode(Enum):
+    """ONU WAN模式
+    """
+    
+    tr069 = 'tr069'
+    internet = 'internet'
+    tr069_internet = 'tr069-internet'
+    other = 'other'
+    multi = 'multi'
+    voip = 'voip'
+    voip_internet = 'voip-internet'
+    iptv = 'iptv'
+    radius = 'radius'
+    radius_internet = 'radius-internet'
+    unicast_iptv = 'unicast-iptv'
+    multicast_iptv = 'multicast-iptv'
+
+class WanType(Enum):
+    """ONU WAN类型
+    """
+
+    bridge = 'bridge'
+    route = 'route'
+
+class DSPMode(Enum):
+    """ONU WAN DSP模式
+    """
+
+    dhcp = 'dhcp'
+    dhcp_remoteid ='dhcp-remoteid'
+    static = 'static'
+    pppoe = 'pppoe'
+
+class PPPoEMode(Enum):
+    """PPPoE 模式
+    """
+
+    auto = 'auto'       # 自动连接
+    payload = 'payload' # 有流量的时候连接
+    manual = 'manual'   # 手动连接
+
+class Type(Enum):
+    """规则类型
+    """
+    sa = 'sa' # 基于SA MAC地址
+    da = 'da' # 基于DA MAC地址
+    sip = 'sip' # 基于源IP地址
+    dip = 'dip' # 基于目的IP地址
+    vid = 'vid' # 基于VLAN ID
+    sport = 'sport' # 基于L4的源Port
+    dport = 'dport' # 基于L4的目的Port
+    iptype = 'iptype' # 基于IP协议类型
+    eth_type =  'eth_type' # 基于以太网
+    tos =  'tos' # 基于IP ToS
+    priority = 'priority' # 基于以太网优先级
+    daipv6pre = 'daipv6pre' # 基于目的IPv6地址前缀
+    saipv6pre  = 'saipv6pre' # 基于源IPv6地址前缀
+    ipver = 'ipver' # 基于IP版本
+    ipv6tra = 'ipv6tra' #  基于IPv6优先级字段分类
+    ipv6fl = 'ipv6fl' # 基于IPv6流量标签
+    ipv6nh = 'ipv6nh' # 基于下一包头(IPv6)
+
+class Operator(Enum):
+    """操作
+    """
+    equal = 0
+    not_equal = 1
+    less_than = 2
+    greater_than = 3
+    exist = 4
+    not_exist = 5
+    always = 6
+
+class Direction(Enum):
+    """流的类型
+    """
+    upstream = 'upstream'  # 上行流
+    downstream = 'downstream' # 下行流
 
 type_str_to_int_value_map = {
     # 用于将show onuqinq-classification-profile返回的字符串转换为数值
@@ -49,7 +182,7 @@ op_str_to_int_value_map = {
     'Always match': 6
 }
 
-def type_str_to_int(strValue):
+def type_str_to_int(value:str) -> int:
     """将show onuqinq-domain-profile返回的type字串转换为数值
 
     Args:
@@ -58,27 +191,27 @@ def type_str_to_int(strValue):
     Returns:
         int: 字符串对应的数值
     """
-    return type_str_to_int_value_map[strValue]
+    return type_str_to_int_value_map[value:str]
 
-def op_str_to_int(strValue):
+def op_str_to_int(value:str) -> int:
     """将show onuqinq-domain-profile返回的op字串转换为数值
 
     Args:
         strValue (str): op字符串
     
     Returns:
-        int: 字符串对应的数值
+        int, str: 字符串对应的数值
     """
-    return op_str_to_int_value_map[strValue]
+    return op_str_to_int_value_map[value]
 
-def onu_value_str_to_str(strValue, intFieldType):
+def onu_value_str_to_str(value:str, field_type:int) -> Union[int, str]:
     """转换show onuqinq-domain-profile返回的value字串
 
     Args:
-        strValue (str): value字符串
-        intFieldType (int): 该字符串对应的Field类型
+        value (str): value字符串
+        field_type (int): 该字符串对应的Field类型
     Returns:
-        any: 处理后的字符串
+        int or str: 处理后的字符串
     """
     # 0: Source MAC				    Source MAC Address 					00 00 00 00 00 00
     # 1: Destination MAC			Destination MAC Address				00 00 00 00 00 00
@@ -98,11 +231,11 @@ def onu_value_str_to_str(strValue, intFieldType):
     # 15: IPv6 flow label			IPV6 Flow Label						00 00 04 57 00 00
     # 16: IPv6 next header		    IPV6 Next Header					0a 00 00 00 00 00
 
-    if intFieldType in [0, 1, 2, 3, 4, 5, 9, 10, 11, 12]:
-        return strValue.replace(' ', '')
+    if field_type in [0, 1, 2, 3, 4, 5, 9, 10, 11, 12]:
+        return value.replace(' ', '')
     
-    if intFieldType in [6, 7, 8, 13, 14, 15, 16]:
-        strList = strValue.split(' ')
+    if field_type in [6, 7, 8, 13, 14, 15, 16]:
+        strList = value.split(' ')
         # remove '00' in the head until meet no '00'
         while len(strList) != 0 and '00' == strList[0]:
             del strList[0]
@@ -110,16 +243,23 @@ def onu_value_str_to_str(strValue, intFieldType):
         while len(strList) != 0 and '00' == strList[-1]:
             del strList[-1]
 
-        strValue = ''.join(strList)
+        value = ''.join(strList)
         # if value is zero, strValue will be empty string, so we need put 0 here to avoid exception
-        if strValue == '':
-            strValue = '0'
+        if value == '':
+            value = '0'
         
         # return
-        return int(strValue, 16)
+        return int(value, 16)
 
-def olt_value_str_to_str(strValue, intFieldId):
+def olt_value_str_to_str(value:str, field_id:int) -> Union[str, int]:
     """ convert value str in show oltqinq-domain to str value
+
+    Args:
+        value (str): 要处理的值
+        field_id (int): 字段类型ID
+    
+    Returns:
+        str or int: 处理后的值
     """
     # 1(Dst Mac)						00 00 00 00 00 00 00 00
     # 2(Src Mac)						00 00 00 00 00 00 00 00
@@ -148,14 +288,14 @@ def olt_value_str_to_str(strValue, intFieldId):
     # 26(IPv6 Flow Label)				[ff ff] 00 00 00 00 00 00
     # 27(IPv6 Next Header)			    [ff] 00 00 00 00 00 00 00
 
-    if intFieldId in [1, 2]:
-        return strValue.replace(' ', '')[:-4]
+    if field_id in [1, 2]:
+        return value.replace(' ', '')[:-4]
 
-    if intFieldId in [12, 13, 14, 15, 22, 23]:
-        return strValue
+    if field_id in [12, 13, 14, 15, 22, 23]:
+        return value
 
-    if intFieldId in [3, 4, 5, 6, 7, 8, 10, 11, 16, 17, 18, 19, 20, 21, 24, 25, 26, 27]:
-        strList = strValue.split(' ')
+    if field_id in [3, 4, 5, 6, 7, 8, 10, 11, 16, 17, 18, 19, 20, 21, 24, 25, 26, 27]:
+        strList = value.split(' ')
         # remove '00' in the head until meet no '00'
         while len(strList) != 0 and '00' == strList[0]:
             del strList[0]
@@ -163,37 +303,36 @@ def olt_value_str_to_str(strValue, intFieldId):
         while len(strList) != 0 and '00' == strList[-1]:
             del strList[-1]
         
-        strValue = ''.join(strList)
+        value = ''.join(strList)
         # if value is zero, strValue will be empty string, so we need put 0 here to avoid exception
-        if strValue == '':
-            strValue = '0'
+        if value == '':
+            value = '0'
         
         # return
-        return int(strValue, 16)
+        return int(value, 16)
     
-    assert False, "unknown field id: %s" % intFieldId
+    assert False, "unknown field id: %s" % field_id
 
-def str_to_bool(strStatus):
+def str_to_bool(status:str) -> bool:
     """将'enable'，'disable'，'enabled'和'disabled'字符串转换为bool类型
 
     Args:
-        strStatus: 待转换的字符串
+        status (str): 待转换的字符串
     
     Returns:
         bool: 'enable'和'enabled'转换为True，'disable'和'disabled'字符串转换为False
     """
-    validate_type('strStatus', strStatus, str)
 
-    strStatus = strStatus.strip().lower()
+    status = status.strip().lower()
 
-    assert strStatus in ['enable','disable', 'enabled', 'disabled'], "仅支持'enable','disable', 'enabled', 'disabled'四种字符串转换，不支持%s" % strStatus
+    assert status in ['enable','disable', 'enabled', 'disabled'], "仅支持'enable','disable', 'enabled', 'disabled'四种字符串转换，不支持%s" % status
     
-    if strStatus.find("enable") != -1:
+    if status.find("enable") != -1:
         return True
     else:
         return False
 
-def bool_to_str(boolStatus):
+def bool_to_str(status:bool) -> str:
     """将bool值转换为'enable'或'disable'字符串
 
     Args:
@@ -201,14 +340,13 @@ def bool_to_str(boolStatus):
     Returns:
         str: True返回'enable'， False返回'disable'
     """
-    validate_type('boolStatus', boolStatus, bool)
 
-    if boolStatus:
+    if status:
         return "enable"
     else:
         return "disable"
 
-def is_vlan_in_list(beginVlan, endVlan, tag, vlanList):
+def is_vlan_in_list(beginVlan:int, endVlan:int, tag:str, vlanList:list) -> bool:
     """检查vlan列表中是否已经包含指定的vlan。如 1000, 1000, 'T'，已经包含在[(1000, 2000, 'T')]列表中。
 
     Args:
@@ -229,20 +367,18 @@ def is_vlan_in_list(beginVlan, endVlan, tag, vlanList):
     
     return isContained
 
-def convert_port_vlan_str(strValue):
+def convert_port_vlan_str(value:str) -> Tuple:
     """将port vlan字串转换成指定格式
 
     Args:
-        strValue (str): port vlan的配置字符串。如， 1000 tag 1/9 2, 3、1000 to 2000 tag 1/9 2格式。
+        value (str): port vlan的配置字符串。如， 1000 tag 1/9 2, 3、1000 to 2000 tag 1/9 2格式。
 
     Returns:
         tuple: (beginVlan, endVlan, tag, slotPortTupleList)格式的元组。如1000, 1000, tag, [(9, 2), (9, 3)]。
     """
-    validate_type('strValue', strValue, str)
-
     vlanExp = re.compile('(\d+)\s+(to\s+(\d+)\s+)?(\w+)\s+\d+/(\d+)\s+([\d\s,]+)')
 
-    beginVlan, _, endVlan, tag, slot, ports  = vlanExp.match(strValue)
+    beginVlan, _, endVlan, tag, slot, ports  = vlanExp.match(value)
     if endVlan == None:
         endVlan = beginVlan
     
@@ -252,14 +388,14 @@ def convert_port_vlan_str(strValue):
 
     return value(beginVlan), value(endVlan), value(tag), portList 
 
-def extract_port_authentication_mode(strValue):
+def extract_port_authentication_mode(value:str) -> dict[int, int]:
     """处理show port authentication-mode命令返回的字符串。
 
     Args:
-        strValue (str): show port authentication-mode命令返回的字符串。
+        value (str): show port authentication-mode命令返回的字符串。
     
     Returns:
-        字典: 字典的键为(slot, pon)，值为授权模式。如， ret[slot, pon] = 'physical id'
+        dict[int, int]: 字典的键为(slot, pon)，值为授权模式。如， ret[slot, pon] = 'physical id'
     """
     # ======================================
     # slot 4 pon 8 ,auth mode is physical id.
@@ -282,9 +418,9 @@ def extract_port_authentication_mode(strValue):
     # slot 4 pon 16 ,auth mode is physical id.
     # -----  PON AUTH, ITEM=16 -----
     # ======================================
-    validate_type('strValue', strValue, str)
+
     
-    lines = strValue.splitlines()
+    lines = value.splitlines()
 
     portAuthExp = re.compile('slot (\d+) pon (\d+) ,auth mode is ([\w\s-+]+).')
 
@@ -302,7 +438,6 @@ def extract_port_authentication_mode(strValue):
         "physical id": AuthMode.phyid
     }
 
-
     ret = { }
     for line in lines:
         match = portAuthExp.match(line)
@@ -312,14 +447,14 @@ def extract_port_authentication_mode(strValue):
         
     return ret
 
-def extract_authorization(strValue):
+def extract_authorization(value:str) -> List[dict]:
     """处理show authorization命令得到的信息
 
     Args:
-        strValue (str): show authorization命令得到的信息
+        value (str): show authorization命令得到的信息
 
     Returns:
-        list: 包含信息的字典列表
+        List[dict]: 包含信息的字典列表
     """
     # ====================================================================================================
     # -----  ONU Auth Table, Total ITEM = 5 -----
@@ -347,7 +482,6 @@ def extract_authorization(strValue):
     # 4    8   127 5506-02-F      A  0   up  FHTT0274ab18
     # 4    8   128 5506-10-A1     A  0   up  FHTT000aae64
     # ====================================================================================================
-    validate_type('strValue', strValue, str)
 
     # 匹配标题
     titlesExp = re.compile('(\w+)\s+(\w+)\s+(\w+)\s+(\w+)\s+(\w+)\s+(\w+)\s+(\w+)\s+(\w+)\s+(\w+)\s+(\w+)\s+(\w+)')
@@ -355,7 +489,7 @@ def extract_authorization(strValue):
     valuesExp = re.compile('([\d\s]{4,4})\s([\d\s]{3,3})\s([\d\s]{3,3})\s([\w\s-]{14,14})\s([\w\s]{2,2})\s([\d\s]{3,3})\s([\w\s]{3,3})\s([\w\s]{12,12})\s(.{10,10}\s)?(.{24,24}\s)?(.{12,12})?')
 
     ret = []
-    lines = strValue.splitlines()
+    lines = value.splitlines()
     titles = None
     for line in lines:
         match = titlesExp.match(line)
@@ -369,19 +503,19 @@ def extract_authorization(strValue):
             # 以字典形式存入
             ret.append({})
             for k, v in zip(titles, values):
-                ret[-1][value(k)] = value(v, maxValue = 65535)
+                ret[-1][auto_convert(k)] = auto_convert(v, max_value=65535)
             continue
     
     return ret
 
-def extract_discovery(strValue):
+def extract_discovery(value:str) -> List[dict]:
     """处理show discovery/show onu discovered得到的信息
     
     Args:
-        strValue (str): show discovery/show onu discovered命令返回的字符串
+        value (str): show discovery/show onu discovered命令返回的字符串
     
     Returns:
-        list: 包含字典的列表
+        List[dict]: 包含字典的列表
     """
     # ====================================================================================
     # ----- ONU Unauth Table, SLOT = 4, PON = 8, ITEM = 1 -----
@@ -408,13 +542,12 @@ def extract_discovery(strValue):
     # 6   5506-02-F      FHTT0274ab18 wangran3   12345678                              1   
     # ====================================================================================
     
-    validate_type('strValue', strValue, str)
 
     slotPortExp = re.compile('SLOT = (\d+), PON = (\d+)')
     titleExp = re.compile('(No)\s+(OnuType)\s+(PhyId)\s+(PhyPwd)\s+(LogicId)\s+(LogicPwd)\s+(Why)\s*')
     valueExp = re.compile('([\d\s]{3,3})\s([\w\s-]{14,14})\s([\w\s]{12,12})\s([\w\s]{10,10})\s([\w\s]{24,24})\s([\w\s]{12,12})\s([\d\s]{1,3})')
 
-    lines = strValue.splitlines()
+    lines = value.splitlines()
 
     ret = [ ]
     titles = None
@@ -442,21 +575,20 @@ def extract_discovery(strValue):
 
     return ret
 
-def extract_auto_discover(strValue):
+def extract_auto_discover(value:str) -> List: # TODO:
     """ 处理show onu auto-discover得到的信息
 
     Args:
-        strValue(str): show onu auto-discover得到的字符串
+        value(str): show onu auto-discover得到的字符串
     
     Returns:
         list: (slot, portNo, status, agingTime)元组组成的列表
     """
-    validate_type('strValue', strValue, str)
 
     exp = re.compile('slot\s*(\d+)\s*pon\s*(\d+)\s*:\s*(\w+)\s*,\s*agingtime:\s*(\d+)\s*s')
 
     ret = [ ]
-    for line in strValue.splitlines():
+    for line in value.splitlines():
         match = exp.match(line)
         if match != None:
             slot, pon, status, agingTime = match.groups()
@@ -464,20 +596,19 @@ def extract_auto_discover(strValue):
 
     return ret
 
-def extract_pon_auto_discover(strValue):
+def extract_pon_auto_discover(value:str) -> Tuple[bool, int]:
     """处理show onu auto-discover得到的信息
     
     Args:
-        strValue(str): show onu auto-discover得到的信息
+        value(str): show onu auto-discover得到的信息
     
     Returns:
         tuple: status, agingTime组成的元组，其中status为bool类型
     """
-    validate_type('strValue', strValue, str)
 
     exp = re.compile('auto-discover-onu:\s+(\w+),\s+agingtime:\s+(\d+)')
 
-    for line in strValue.splitlines():
+    for line in value.splitlines():
         match = exp.match(line)
         if match:
             strStatus, strAgingTime = match.groups()
@@ -525,8 +656,6 @@ def extract_manage_vlan(strValue):
     # TX bytes        : 704
     # MTU             : 0
 
-    validate_type('strValue', strValue, str)
-
     keyValueExp = re.compile('([\w\s]+):\s(.+)')
 
     ret = [ ]
@@ -536,8 +665,8 @@ def extract_manage_vlan(strValue):
         match = keyValueExp.match(line)
         if match:
             k, v = match.groups()
-            k = value(k)
-            v = value(v)
+            k = auto_convert(k)
+            v = auto_convert(v)
 
             if k == 'Manage name':
                 ret.append({ })
@@ -556,8 +685,6 @@ def extract_whitelist(strValue):
         list: 包含处理后的信息列表
     """
     # 支持匹配6种输出
-
-    validate_type('strValue', strValue, str)
 
     lines = strValue.splitlines()
 
@@ -638,7 +765,7 @@ def extract_whitelist(strValue):
                 values = match.groups()
                 ret.append({ })
                 for k, v in zip(titles, values):
-                    ret[-1][value(k)] = value(v)
+                    ret[-1][auto_convert(k)] = auto_convert(v)
 
     return ret
 
@@ -661,7 +788,7 @@ def extract_last_reg_status_change(strValue):
     # 4    8   100 Last Off Time = 0000-00-00 00:00:00,Last On Time = 0000-00-00 00:00:00.
     # SLOT PON ONU LAST_OFF_TIME LAST_ON_TIME
     # 4    8   128 Last Off Time = 0000-00-00 00:00:00,Last On Time = 2020-09-22 14:09:30.
-    validate_type('strValue', strValue, str)
+
     lines = strValue.splitlines()
 
     titles = ['SLOT', 'PON', 'ONU', 'LAST_OFF_TIME', 'LAST_ON_TIME']
@@ -674,7 +801,7 @@ def extract_last_reg_status_change(strValue):
             values = match.groups()
             ret.append({ })
             for k, v in zip(titles, values):
-                ret[-1][value(k)] = value(v)
+                ret[-1][auto_convert(k)] = auto_convert(v)
     
     return ret
 
@@ -692,7 +819,6 @@ def extract_dhcp_state(strValue):
     # DHCP option37  : disabled
     # EPON DHCP Patch   : disabled
     # EPON ARP Patch    : disabled
-    validate_type('strValue', strValue, str)
 
     ret = { }
     for line in strValue.splitlines():
@@ -713,7 +839,6 @@ def extract_onu_port_vlan(strValue):
     # NO.  SL/LI/ONU PORT ID TYPE  MODE CVID COS  TPID  TVID COS  TPID  SVID COS  TPID  PVID COS  SRVTYPE PRIQUE  GEMPORT
     # ====================================================================================================================
     # 1    4 /8 /1   1    1  unica tran null null 33024 null null null  null null null  null null default default default
-    validate_type('strValue', strValue, str)
 
     ret = [ ]
     titles = ['NO', 'SL', 'LI', 'ONU', 'PORT', 'ID', 'TYPE', 'MODE', 'CVID', 'CCOS', 'CTPID', 'TVID', 'TCOS', 'TTPID', 'SVID', 'SCOS', 'STPID', 'PVID', 'PCOS', 'SRVTYPE', 'PRIQUE', 'GEMPORT']
@@ -723,7 +848,7 @@ def extract_onu_port_vlan(strValue):
         if match != None:
             ret.append({})
             for k, v in zip(titles, match.groups()):
-                ret[-1][k] = value(v)
+                ret[-1][k] = auto_convert(v)
 
     return ret
 
@@ -761,7 +886,6 @@ def extract_card_info(strValue):
     # 8     ---      ---      ---         ---         ---
     # 9     YES     HSCA     HSCA     MATCH/M         ---
     # 10     ---     HSCA      ---         ---         ---
-    validate_type('strValue', strValue, str)
 
     lines = strValue.splitlines()
 
@@ -783,7 +907,7 @@ def extract_card_info(strValue):
                 ret.append({ })
                 for k, v in zip(titles, values):
                     if k != None:
-                        ret[-1][value(k)] = value(v)
+                        ret[-1][auto_convert(k)] = auto_convert(v)
                 continue
 
     return ret
@@ -836,8 +960,6 @@ def extract_onu_port_status(strValue):
     # PORT CONNECT    : full
     # LOOPBACK STATUS : normal
 
-    validate_type('strValue', strValue, str)
-
     summaryExp = re.compile('SLOT:(\d+)\s*PON:(\d+)\s*ONU:(\d+)\s*,\s*ITEM=(\d+)')
     portIdExp = re.compile('PORT\s+ID\s+=\s+(\d+)')
     keyValueExp = re.compile('(.+):(.+)')
@@ -849,10 +971,10 @@ def extract_onu_port_status(strValue):
         match = summaryExp.match(line)
         if match:
             slot, pon, onu, item = match.groups()
-            ret['SLOT'] = value(slot)
-            ret['PON'] = value(pon)
-            ret['ONU'] = value(onu)
-            ret['ITEM'] = value(item)
+            ret['SLOT'] = auto_convert(slot)
+            ret['PON'] = auto_convert(pon)
+            ret['ONU'] = auto_convert(onu)
+            ret['ITEM'] = auto_convert(item)
             ret['PORT'] = [ ]
             continue
         
@@ -860,17 +982,17 @@ def extract_onu_port_status(strValue):
         if match:
             portId = match.groups()[0]
             ret['PORT'].append({ })
-            ret['PORT'][-1]['PORT ID'] = value(portId)
+            ret['PORT'][-1]['PORT ID'] = auto_convert(portId)
             continue
         
         match = keyValueExp.match(line)
         if match:
             k, v = match.groups()
-            if value(k) not in ret['PORT'][-1].keys():
-                ret['PORT'][-1][value(k)] = value(v)
+            if auto_convert(k) not in ret['PORT'][-1].keys():
+                ret['PORT'][-1][auto_convert(k)] = auto_convert(v)
             else:
                 # 有两个PORT CONNECT， 需要把后一个换个名字
-                ret['PORT'][-1]['PORT MODE'] = value(v)
+                ret['PORT'][-1]['PORT MODE'] = auto_convert(v)
             continue
 
     return ret
@@ -904,7 +1026,6 @@ def extract_igmp_vlan(strValue):
     # igi->igi_cflags          :0x0
     # igi->igi_sflags          :0x0
     # ========================================
-    validate_type('strValue', strValue, str)
 
     regexExp = re.compile("(.+):(.+)")
 
@@ -915,7 +1036,7 @@ def extract_igmp_vlan(strValue):
         match = regexExp.match(line)
         if match != None:
             k, v = match.groups()
-            ret[value(k)] = value(v)
+            ret[auto_convert(k)] = auto_convert(v)
 
     return ret
 
@@ -934,8 +1055,6 @@ def extract_port_vlan(strValue):
     # 1251 ~ 1254(T).
     # 3049 ~ 3049(T).
 
-    validate_type('strValue', strValue, str)
-
     vlanExp = re.compile('(\d+)\s?~?\s?(\d+)?\(([UT])\)')
 
     lines = strValue.splitlines()
@@ -949,7 +1068,7 @@ def extract_port_vlan(strValue):
             if endVlan == None:
                 endVlan = beginVlan
 
-            ret.append((value(beginVlan), value(endVlan), value(tag)))
+            ret.append((auto_convert(beginVlan), auto_convert(endVlan), auto_convert(tag)))
     
     return ret
 
@@ -962,7 +1081,6 @@ def extract_wan_cfg(strValue):
     Return:
         dict: 包含wan cfg信息的字典
     """
-    validate_type('strValue', strValue, str)
 
     ret = None
 
@@ -988,18 +1106,18 @@ def extract_wan_cfg(strValue):
         
         slot, port, onuId, index, name, mode, type, wvid, wcos, nat, qos, upnp = mandatoryPartExp.match(strValue).groups()
         
-        ret['slot'] = value(slot)
-        ret['port'] = value(port)
-        ret['onuId'] = value(onuId)
-        ret['index'] = value(index)
-        ret['name'] = value(name)
+        ret['slot'] = auto_convert(slot)
+        ret['port'] = auto_convert(port)
+        ret['onuId'] = auto_convert(onuId)
+        ret['index'] = auto_convert(index)
+        ret['name'] = auto_convert(name)
         ret['mode'] = WanMode(mode.lower())
         ret['type'] = WanType(type.lower())
-        ret['wvid'] = value(wvid)
-        ret['wcos'] = value(wcos)
-        ret['nat'] = value(nat)
-        ret['qos'] = value(qos)
-        ret['upnp'] = value(upnp)
+        ret['wvid'] = auto_convert(wvid)
+        ret['wcos'] = auto_convert(wcos)
+        ret['nat'] = auto_convert(nat)
+        ret['qos'] = auto_convert(qos)
+        ret['upnp'] = auto_convert(upnp)
 
     if vlanmodeExp.search(strValue) != None:
 
@@ -1007,12 +1125,12 @@ def extract_wan_cfg(strValue):
         
         ret['vlanmode'] = tag.lower() 
         ret['tvlan'] = translate
-        ret['tvid'] = value(tvlan)
-        ret['tcos'] = value(tcos)
+        ret['tvid'] = auto_convert(tvlan)
+        ret['tcos'] = auto_convert(tcos)
         ret['qinq'] = qinq
-        ret['stpid'] = value(stpid)
-        ret['svlan'] = value(svlan)
-        ret['scos'] = value(scos)
+        ret['stpid'] = auto_convert(stpid)
+        ret['svlan'] = auto_convert(svlan)
+        ret['scos'] = auto_convert(scos)
 
     if ret != None and 'dsp' not in ret.keys() and pppoeDSPExp.search(strValue) != None:
         
@@ -1021,19 +1139,19 @@ def extract_wan_cfg(strValue):
         ret['dsp'] = DSPMode(dsp.lower())
         ret['proxy'] = 'enable' if proxy == '1' else 'disable'
         ret['pppoemode'] = PPPoEMode(pppoemode.lower())
-        ret['username'] = value(username)
-        ret['password'] = value(password)
-        ret['servername'] = value(servername)
+        ret['username'] = auto_convert(username)
+        ret['password'] = auto_convert(password)
+        ret['servername'] = auto_convert(servername)
 
     if ret != None and 'dsp' not in ret.keys() and staticDSPExp.search(strValue) != None:
         
         dsp, ip, mask, gate, master, slave = staticDSPExp.search(strValue).groups()
         ret['dsp'] = DSPMode(dsp.lower())
-        ret['ip'] = value(ip)
-        ret['mask'] = value(mask)
-        ret['gate'] = value(gate)
-        ret['master'] = value(master)
-        ret['slave'] = value(slave)
+        ret['ip'] = auto_convert(ip)
+        ret['mask'] = auto_convert(mask)
+        ret['gate'] = auto_convert(gate)
+        ret['master'] = auto_convert(master)
+        ret['slave'] = auto_convert(slave)
 
     if ret != None and 'dsp' not in ret.keys() and dhcpDSPExp.search(strValue) != None:
         
@@ -1088,8 +1206,6 @@ def extract_igmp_mode_info(strValue):
     # Last member query count   :  2
     # Query interval            :  125
     # Query response interval   :  10
-
-    validate_type('strValue', strValue, str)
 
     keyValueExp = re.compile('\s*(.+)\s*:\s*(.+)\s*')
     
@@ -1151,8 +1267,6 @@ def extract_onu_statistics(strValue):
     # Rx_power                        :          -13.14 (dbm)
     # OLT_Rx_power                    :          -14.32 (dbm)
 
-    validate_type('strValue', strValue, str)
-
     ret = { }
 
     exp = re.compile('(.+):(.+)\((.+)\)')
@@ -1191,7 +1305,6 @@ def extract_bandwidth_profile(strValue):
     # Id   Name                 upMin  upMax  downMin downMax upFix
     # ------------------------------------------------------------------
     # 3    bwp                  10000  10000  10000  10000  10000
-    validate_type('strValue', strValue, str)
 
     summaryRegex = re.compile('-+\s+onubandwidth\sprofile,\snum\s+=\s+(\d+)\s-+')
 
@@ -1204,25 +1317,25 @@ def extract_bandwidth_profile(strValue):
     count = None
     for line in strValue.splitlines():
 
-        match = titlesre.match(line)
-        if itemsre.match(line):
+        match = titlesRegex.match(line)
+        if itemsRegex.match(line):
             
             values = match.groups()
 
             save = { }
             for t, v in zip(titles, values):
-                save[t] = value(v)
+                save[t] = auto_convert(v)
             
             ret.append(save)
             continue
 
-        match = summaryre.match(line)
+        match = summaryRegex.match(line)
         if match:
             assert len(match.groups()) == 1
             count = int(match.groups()[0])
             continue
 
-        match = titlesre.match(line)
+        match = titlesRegex.match(line)
         if match:
             titles = match.groups()
             continue
@@ -1247,7 +1360,6 @@ def extract_onu_bandwidth(strValue):
     # downAssureBand: 640.
     # upFixband: 0.
     # prfId: -1.
-    validate_type('strValue', strValue, str)
 
     ret = { }
     keyValueRegexExp = re.compile('\s*(\w+)\s*:\s*(-?\d+)\s*\.')
@@ -1255,7 +1367,7 @@ def extract_onu_bandwidth(strValue):
         match = keyValueRegexExp.match(line)
         if match:
             k, v = match.groups()
-            ret[k]=value(v)
+            ret[k]=auto_convert(v)
     
     return ret
 
@@ -1268,7 +1380,6 @@ def extract_bandwidth(strValue):
     Returns:
         dict: 包含bandwitdh信息的字典
     """
-    validate_type('strValue', strValue, str)
 
     # BANDWIDTH: UP 20000      DOWN 20000
     regexExp = 'BANDWIDTH:\s*UP\s*(\d+)\s*DOWN\s*(\d+)'
@@ -1279,8 +1390,8 @@ def extract_bandwidth(strValue):
         match = regexExp.match(line)
         if match:
             usPir, dsPir = match.group()
-            ret['UP'] = value(usPir)
-            ret['DOWN'] = value(dsPir)
+            ret['UP'] = auto_convert(usPir)
+            ret['DOWN'] = auto_convert(dsPir)
         
     return ret
 
@@ -1303,7 +1414,6 @@ def extract_onu_layer3_rate_limit_profile(strValue):
     # Wan name: 2_INTERNET_B_VID_1000.
     # Up bandwidth profile id: 65535.
     # Down bandwidth profile id: 65535.
-    validate_type('strValue', strValue, str)
 
     regexExp = re.compile('(.+)\s*:\s*(.+).')
 
@@ -1317,7 +1427,7 @@ def extract_onu_layer3_rate_limit_profile(strValue):
             if k == 'Wan index':
                 ret.append({ })
             
-            ret[-1][k] = value(v)
+            ret[-1][k] = auto_convert(v)
     
     return ret
 
@@ -1336,7 +1446,6 @@ def extract_service_vlan(strValue):
     # servicevlan 102 :
     # name : sip,   type : voip
     # vlan range: 3990 #####end.
-    validate_type('strValue', strValue, str)
 
     vlanIndexExp = re.compile('servicevlan\s+(\d+)\s+:\s*')
     nameTypeExp = re.compile('name\s+:\s+(.+),\s+type\s+:\s+(.+)\s*')
@@ -1347,18 +1456,18 @@ def extract_service_vlan(strValue):
         match = vlanIndexExp.match(line)
         if match:
             ret.append({ })
-            ret[-1]['servicevlan'] = value(match.groups()[0].strip())
+            ret[-1]['servicevlan'] = auto_convert(match.groups()[0].strip())
             continue
 
         match = nameTypeExp.match(line)
         if match:
-            ret[-1]['name'] = value(match.groups()[0].strip())
-            ret[-1]['type'] = value(match.groups()[1].strip())
+            ret[-1]['name'] = auto_convert(match.groups()[0].strip())
+            ret[-1]['type'] = auto_convert(match.groups()[1].strip())
             continue
 
         match = svlanExp.match(line)
         if match:
-            ret[-1]['vlan range'] = value(match.groups()[0].strip())
+            ret[-1]['vlan range'] = auto_convert(match.groups()[0].strip())
             continue
     
     return ret
@@ -1385,7 +1494,7 @@ def extract_onu_qinq_classification_profile(strValue):
     # Type: Source MAC Address        Value: 00 00 00 00 00 00                        Operator: No exist then match
     # Type: Source MAC Address        Value: 00 00 00 00 00 00                        Operator: No exist then match
     # Type: Source MAC Address        Value: 00 00 00 00 00 00                        Operator: No exist then match
-    validate_type('strValue', strValue, str)
+
     
     profileNameExp = re.compile('-+.+\[(.+)\].+-+')
     profileIndexExp = re.compile('Index: (\d+)')
@@ -1401,7 +1510,7 @@ def extract_onu_qinq_classification_profile(strValue):
 
         match = profileIndexExp.match(line)
         if match:
-            ret[-1]['index'] = value(match.groups()[0].strip())
+            ret[-1]['index'] = auto_convert(match.groups()[0].strip())
             continue
         
         match = profileFieldValueOpExp.match(line)
@@ -1441,7 +1550,6 @@ def extract_olt_qinq_domain(strValue):
     # Layer 2: oldvlan[0] oldcos[0] action[3] tpid[0x8100] cos[255] newvlan[65535]
     # Layer 3: oldvlan[65535] oldcos[255] action[3] tpid[0x8100] cos[255] newvlan[65535]
     # Layer 4: oldvlan[65535] oldcos[255] action[3] tpid[0x8100] cos[255] newvlan[65535]
-    validate_type('strValue', strValue, str)
 
     qinqNameExp = re.compile('-+.+\[(.+)\].+-+')
     qinqIndexAndSvcIndexExp = re.compile('Domain index:\s*(\d+)\s*Service num:\s*(\d+)\s*')
@@ -1482,29 +1590,29 @@ def extract_olt_qinq_domain(strValue):
     for line in strValue.splitlines():
         match = qinqNameExp.match(line)
         if match:
-            ret['name'] = value(match.groups()[0])
+            ret['name'] = auto_convert(match.groups()[0])
             continue
 
         match = qinqIndexAndSvcIndexExp.match(line)
         if match:
-            ret['index'] = value(match.groups()[0])
-            ret['count'] = value(match.groups()[1])
+            ret['index'] = auto_convert(match.groups()[0])
+            ret['count'] = auto_convert(match.groups()[1])
             ret['services'] = [ ]
             continue
 
         match = serviceTypeAndIDExp.match(line)
         if match:
             ret['services'].append({ })
-            ret['services'][-1]['no'] = value(match.groups()[1])
-            ret['services'][-1]['type'] = 'single' if value(match.groups()[0]) == 0 else 'share'
+            ret['services'][-1]['no'] = auto_convert(match.groups()[1])
+            ret['services'][-1]['type'] = 'single' if auto_convert(match.groups()[0]) == 0 else 'share'
             ret['services'][-1]['rule'] = { }
             ret['services'][-1]['vlan'] = [ ]
             continue
 
         match = serviceIndexAndRuleExp.match(line)
         if match:
-            no = value(match.groups()[0])
-            upOrDownStream = value(match.groups()[1])
+            no = auto_convert(match.groups()[0])
+            upOrDownStream = auto_convert(match.groups()[1])
             assert no == ret['services'][-1]['no']
             ret['services'][-1]['rule'][upOrDownStream] = [ ]
             lastKey = upOrDownStream
@@ -1513,15 +1621,15 @@ def extract_olt_qinq_domain(strValue):
         match = typeValueOpExp.match(line)
         if match:
             typeCode, rawValue, opCode = match.groups()
-            intType = value(typeCode)
+            intType = auto_convert(typeCode)
             strValue = olt_value_str_to_str(rawValue, intType)
-            intOp = value(opCode)
+            intOp = auto_convert(opCode)
             ret['services'][-1]['rule'][lastKey].append((intType, strValue, intOp))
             continue
 
         match = serviceVlanInfoExp.match(line)
         if match:
-            no = value(match.groups()[0])
+            no = auto_convert(match.groups()[0])
             assert no == ret['services'][-1]['no']
             continue
         
@@ -1537,7 +1645,7 @@ def extract_olt_qinq_domain(strValue):
             else:
                 raise ValueError('unknown action value: %s' % action)
 
-            ret['services'][-1]['vlan'].append((value(layerNo), value(oldVlan, 65535), value(oldCos, 255), value(action), value(newTpid), value(newCos, 255), value(newVlan, 65535)))
+            ret['services'][-1]['vlan'].append((auto_convert(layerNo), auto_convert(oldVlan, 65535), auto_convert(oldCos, 255), auto_convert(action), auto_convert(newTpid), auto_convert(newCos, 255), auto_convert(newVlan, 65535)))
             continue
 
     return ret
@@ -1551,7 +1659,6 @@ def extract_olt_qinq_domain_bound_info(strValue):
     Returns:
         tuple: 返回(slot, portNo)元组
     """
-    validate_type('strValue', strValue, str)
 
     lines = strValue.splitlines()
 
@@ -1561,7 +1668,7 @@ def extract_olt_qinq_domain_bound_info(strValue):
         match = ponBoundInfoExp.match(line)
         if match:
             slot, portNo = match.groups()
-            return value(slot), value(portNo)
+            return auto_convert(slot), auto_convert(portNo)
 
     assert False, '没有找到绑定信息: %s' % strValue
 
@@ -1605,7 +1712,6 @@ def extract_pppoe_plus(strValue):
     Returns:
         dict: 包含PPPoE-Plus状态信息的字典
     """
-    validate_type('strValue', strValue, str)
 
     stateExp = re.compile('(.+):(.+)')
 
@@ -1616,7 +1722,7 @@ def extract_pppoe_plus(strValue):
         match = stateExp.match(line)
         if match:
             k, v = match.groups()
-            ret[value(k)] = value(v)
+            ret[auto_convert(k)] = auto_convert(v)
     
     return ret
 
@@ -1629,7 +1735,6 @@ def extract_ip_address(strValue):
     Returns:
         tuple: 返回ip与mask组成的元组
     """
-    validate_type('strValue', strValue, str)
 
     lines = strValue.splitlines()
 
@@ -1640,11 +1745,11 @@ def extract_ip_address(strValue):
     for line in lines:
         match = ipExpr.search(line)
         if match:
-            ip = value(match.groups()[0])
+            ip = auto_convert(match.groups()[0])
 
         match = maskExpr.search(line)
         if match:
-            mask = value(match.groups()[0])
+            mask = auto_convert(match.groups()[0])
     
     if ip == None or mask == None:
         raise RuntimeWarning('未找到IP/MASK信息')
@@ -1660,7 +1765,6 @@ def extract_acl(strValue):
     Returns:
         list: 返回包含ACL信息的列表
     """
-    validate_type('strValue', strValue, str)
 
     titles = ['No', 'IP', 'Mask', 'Status']
 
@@ -1673,7 +1777,7 @@ def extract_acl(strValue):
         if match:
             ret.append({ })
             for t, v in zip(titles, match.groups()):
-                ret[value(t)] = value(v)
+                ret[auto_convert(t)] = auto_convert(v)
     
     return ret
 
@@ -1686,7 +1790,6 @@ def extract_snmp_time(strValue):
     Returns:
         dict: 包含ip和interval信息的字典
     """
-    validate_type('strValue', strValue, str)
 
     intervalExpr = re.compile('INTERVAL=(\d+)')
     ipExpr = re.compile('Server\s+IP\s+:\s+(\d+\\.\d+\\.\d+\\.\d+)')
@@ -1697,11 +1800,11 @@ def extract_snmp_time(strValue):
     for line in lines:
         match = intervalExpr.search(line)
         if match:
-            interval = value(match.groups()[0])
+            interval = auto_convert(match.groups()[0])
 
         match = ipExpr.search(line)
         if match:
-            ip = value(match.groups()[0])
+            ip = auto_convert(match.groups()[0])
 
     if ip == None or interval == None:
         raise RuntimeWarning('未找到IP和Interval信息')
@@ -1717,7 +1820,7 @@ def extract_current_alarm(strValue):
     Returns:
         list: 包含信息的字典
     """
-    validate_type('strValue', strValue, str)
+
     # TODO: FIXME: 抽取告警信息没有实现
     titleExpr = re.compile('\s*(Item Description)\s+(Code vOLT)\s+(Object)\s+(Begintime)\s+(Endtime)\s*')
     valueExpr = re.compile('???')
@@ -1740,33 +1843,86 @@ def extract_current_alarm(strValue):
 
     return ret
 
-
-class OLTCLI_AN6K_17:
-    """OLTCLI类。通过它，可以对OLT进行操作，就像输入命令行调用一样。
-
+class OLTModel(Enum):
+    """OLT Model
     """
+    AN6000_17 = 'AN6000_17'
 
-    def __init__(self, olt_dev):
-        """OLT构造函数。
+class OLTCLI:
+
+    @staticmethod
+    def get(model:OLTModel, ip:str, username:str, password:str):
+        """get OLT CLI
 
         Args:
-            olt_dev (Device): OLT设备资源
+            model (OLTModel): OLT Model, supoorts AN6000-17
+            ip (str): [description]
+            username (str): [description]
+            password (str): [description]
+
+        Returns:
+            OLTCIL: OLT CLI
         """
-        self.olt_dev = olt_dev
+        if model == OLTModel.AN6000_17:
+            return OLTCLI_AN6K17(ip, username, password)
+
+class OLTCLI_AN6K17:
+    """OLTCLI for AN6000-17 serie
+
+    封装了OLT常用的命令
+    """
+
+    def __init__(self, ip:str, username:str, password:str) -> NoReturn:
+        """OLT构造函数
+
+        Args:
+            ip (str): OLT IP地址
+            username (str): OLT Telnet用户名
+            password (str): OLT Telnet密码
+        """
+        self._ip = ip
+        self._username = username
+        self._password = password
     
-    def del_onu_caps_profile(self, name):
+    @property
+    def ip(self) -> str:
+        """OLT Telnet IP地址
+
+        Returns:
+            str: OLT IP地址
+        """
+        return self._ip
+
+    @property
+    def username(self) -> str:
+        """OLT Telnet用户名
+
+        Returns:
+            str: OLT Telnet用户名
+        """
+        return self._username
+
+    @property
+    def password(self) -> str:
+        """OLT Telnet密码
+
+        Returns:
+            str: OLT Telnet密码
+        """
+        return self._password
+
+    def del_onu_caps_profile(self, name:str) -> NoReturn:
         """删除ONU能力集模板
 
         Args:
             name (str): ONU能力集名称
         """
-        validate_type('name', name, str)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('no onu caps-profile name %s' % name)
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('no onu caps-profile name %s' % name)
 
-    def add_onu_caps_profile(self, name, onutype, pontype, onucapa, lan1g, lan10g, lan25g, lan2_5g, pots):
+    def add_onu_caps_profile(self, name:str, onutype:int, pontype:int, onucapa:int, lan1g:int, lan10g:int, lan25g:int, lan2_5g:int, pots:int) -> NoReturn:
         """配置ONU能力集
 
         Args:
@@ -1788,34 +1944,25 @@ class OLTCLI_AN6K_17:
             lan2_5g (int): 2.5G端口对应的端口号
             pots (int): pots端口号
         """
-        validate_type('name', name, str)
-        validate_type('onutype', onutype, int)
-        validate_type('pontype', pontype, int)
-        validate_type('onucapa', onucapa, int)
-        validate_type('lan1g', lan1g, int)
-        validate_type('lan10g', lan10g, int)
-        validate_type('lan25g', lan25g, int)
-        validate_type('lan2_5g', lan2_5g, int)
-        validate_type('pots', pots, int)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('onu caps-profile add name %s onutype %s pontype %s onucapa %s lan1g %s lan10g %s lan25g %s lan2.5g %s pots %s end' % (name, onutype, pontype, onucapa, lan1g, lan10g, lan25g, lan2_5g, pots))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('onu caps-profile add name %s onutype %s pontype %s onucapa %s lan1g %s lan10g %s lan25g %s lan2.5g %s pots %s end' % (name, onutype, pontype, onucapa, lan1g, lan10g, lan25g, lan2_5g, pots))
 
-    def get_snmp_time(self):
+    def get_snmp_time(self) -> dict:
         """获取SNMP时间配置
 
         Returns:
             dict: 包含时间配置参数的字典。interval，表示时间间隔；ip，表示SNMP对时的IP地址。
         """
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            result = conn.run_cmd('show snmp-time')
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            result = conn.run('show snmp-time')
         
         return extract_snmp_time(result)
 
-    def set_snmp_time(self, interval, type, ip):
+    def set_snmp_time(self, interval:int, type:str, ip:str) -> NoReturn:
         """设置SNMP相关参数
         
         Args:
@@ -1823,15 +1970,12 @@ class OLTCLI_AN6K_17:
             type(str): IP类型。有ipv4、ipv6、ipv4z、ipv6z和dns
             ip(str): IP地址
         """
-        validate_type('interval', interval, int)
-        validate_type('type', type, str)
-        validate_type('ip', ip, str)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('snmp-time interval %s servip %s %s' % (interval, type, ip))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('snmp-time interval %s servip %s %s' % (interval, type, ip))
 
-    def set_time_mode(self, mode, hour, min, ems_hour, ems_min):
+    def set_time_mode(self, mode:str, hour:str, min:int, ems_hour:str, ems_min:int) -> NoReturn:
         """设置系统时间模式
 
         Args:
@@ -1841,17 +1985,12 @@ class OLTCLI_AN6K_17:
             ems-hour (str): EMS时区, 如 GMT+5:30、GMT+8
             ems-min (int): 时区分钟
         """
-        validate_type('mode', mode, str)
-        validate_type('hour', hour, str)
-        validate_type('min', min, int)
-        validate_type('ems_hour', ems_hour, str)
-        validate_type('ems_min', ems_min, int)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('time %s hour %s min %s ems-hour %s ems-min %s' % (mode, hour, min, ems_hour, ems_min))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('time %s hour %s min %s ems-hour %s ems-min %s' % (mode, hour, min, ems_hour, ems_min))
 
-    def set_time(self, year, month, day, time):
+    def set_time(self, year:int, month:int, day:int, time:str) -> NoReturn:
         """设置系统时间
 
         Args:
@@ -1860,16 +1999,12 @@ class OLTCLI_AN6K_17:
             day (int): 日
             time (str): HH:MM:SS字符串的时间
         """
-        validate_type('year', year, int)
-        validate_type('month', month, int)
-        validate_type('day', day, int)
-        validate_type('time', time, str)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('time %s %s %s %s' % (year, month, day, time))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('time %s %s %s %s' % (year, month, day, time))
 
-    def set_traffic_suppress(self, slot, rate, type='all'):
+    def set_traffic_suppress(self, slot:int, rate:int, type:Optional[str]='all') -> NoReturn:
         """设置卡的包抑制参数
 
         Args:
@@ -1877,13 +2012,10 @@ class OLTCLI_AN6K_17:
             rate (int): 速率
             type (str, optional): 抑制类型。支持broadcast、multicast、unknown和all。默认'all'。
         """
-        validate_type('slot', slot, int)
-        validate_type('rate', rate, int)
-        validate_type('type', type, str)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('traffic-suppress 1/%s %s value %s' % (slot, type, rate))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('traffic-suppress 1/%s %s value %s' % (slot, type, rate))
 
     def set_card_auth(self, slot, type):
         """授权指定卡盘
@@ -1892,21 +2024,19 @@ class OLTCLI_AN6K_17:
             slot (int): 槽位号
             type (str): 卡类型
         """
-        validate_type('slot', slot, int)
-        validate_type('type', type, str)
 
         type = self.get_card_type(slot)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('card auth 1/%s %s' % (slot, type))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('card auth 1/%s %s' % (slot, type))
 
     def set_card_auto_auth(self):
         """对卡进行自动授权
         """
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('card auto-auth')  
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('card auto-auth')  
 
     def get_card_type(self, slot):
         """查询卡的类型
@@ -1917,11 +2047,10 @@ class OLTCLI_AN6K_17:
         Returns:
             str: 卡的类型
         """
-        validate_type('slot', slot, int)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            result = conn.run_cmd('show card info')
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            result = conn.run('show card info')
         
         entires = extract_card_info(result)
         for entry in entires:
@@ -1939,11 +2068,10 @@ class OLTCLI_AN6K_17:
         Args:
             slot (int): 卡的槽位号
         """
-        validate_type('slot', slot, int)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('card unauth 1/%s' % slot)
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('card unauth 1/%s' % slot)
 
     def set_acl(self, ip, mask , status):
         """设置ACL，即允许或者禁止访问的IP网段
@@ -1956,9 +2084,6 @@ class OLTCLI_AN6K_17:
         Returns:
             int: 返回设置的ID号
         """
-        validate_type('ip', ip, str)
-        validate_type('mask', mask, str)
-        validate_type('status', status, str)
 
         # 找一个空闲的ID
         id = None
@@ -1966,9 +2091,9 @@ class OLTCLI_AN6K_17:
             if entry['IP'] == '0.0.0.0' and entry['Mask'] == '0.0.0.0' and entry['Status'] == 'disable':
                 id = entry['No']
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('acl %s ip %s mask %s %s' % (id, ip, mask, status))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('acl %s ip %s mask %s %s' % (id, ip, mask, status))
 
         return id
 
@@ -1981,9 +2106,9 @@ class OLTCLI_AN6K_17:
         Returns:
             list或dict: 返回包含{No, IP, Mask, Status}字典的列表，或返回单个字典
         """
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            result = conn.run_cmd('show acl')
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            result = conn.run('show acl')
         
         if id == None:
             return extract_acl(result)
@@ -2003,19 +2128,16 @@ class OLTCLI_AN6K_17:
             mask (str或int, optional): 子网掩码，接受点格式的，或者数字长度格式的
             metric (int): 下一跳的metric，默认None，不提供
         """
-        validate_type('hop', hop, str)
-        validate_type('ip', ip, str)
 
         if type(mask) != str and type(mask) != int:
             raise RuntimeWarning('只接受点分格式或者长度格式的掩码')
 
-
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
             if metric == None:
-                conn.run_cmd('no static-route destination-ip  %s mask %s nexthop %s' % (ip, mask, hop)) 
+                conn.run('no static-route destination-ip  %s mask %s nexthop %s' % (ip, mask, hop)) 
             else:
-                conn.run_cmd('no static-route destination-ip  %s mask %s nexthop %s metric %s' % (ip, mask, hop, metric)) 
+                conn.run('no static-route destination-ip  %s mask %s nexthop %s metric %s' % (ip, mask, hop, metric)) 
 
     def set_static_route(self, hop, ip = '0.0.0.0', mask = '0.0.0.0', metric = 0):
         """配置静态路由
@@ -2026,17 +2148,13 @@ class OLTCLI_AN6K_17:
             mask (str或int, optional): 子网掩码，接受点格式的，或者数字长度格式的, 默认0.0.0.0
             metric (int): 下一跳的metric，默认0
         """
-        validate_type('hop', hop, str)
-        validate_type('ip', ip, str)
 
         if type(mask) != str and type(mask) != int:
             raise RuntimeWarning('只接受点分格式或者长度格式的掩码')
 
-        validate_type('metric', metric, int)
-
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('static-route destination-ip  %s mask %s nexthop %s metric %s' % (ip, mask, hop, metric))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('static-route destination-ip  %s mask %s nexthop %s metric %s' % (ip, mask, hop, metric))
 
     def set_manage_vlan(self, name, svlan, cvlan):
         """设置带内管理VLAN
@@ -2045,13 +2163,10 @@ class OLTCLI_AN6K_17:
             svlan (int): SVLAN，外层VLAN
             cvlan (int): CVLAN，内层VLAN
         """
-        validate_type('name', name, str)
-        validate_type('svlan', svlan, int)
-        validate_type('cvlan', cvlan, int)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('manage-vlan %s svlan %s cvlan %s' % (name, svlan, cvlan))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('manage-vlan %s svlan %s cvlan %s' % (name, svlan, cvlan))
 
     def set_manage_vlan_ip(self, version, name, ip, mask):
         """设置带内管理IP
@@ -2062,10 +2177,6 @@ class OLTCLI_AN6K_17:
             ip (str): IP地址
             mask (int或str): 子网掩码，如，255.255.255.0，或子网掩码长度，24
         """
-        validate_type('version', version, str)
-        validate_type('name', name, str)
-        validate_type('ip', ip, str)
-        
         if type(mask) == str:
             mask = len_of_mask(mask)
         if type(mask) == int:
@@ -2073,9 +2184,9 @@ class OLTCLI_AN6K_17:
         else:
             raise RuntimeWarning('mask类型非法，只接受str或int类型')
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('manage-vlan %s %s %s/%s' % (version, name, ip, mask))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('manage-vlan %s %s %s/%s' % (version, name, ip, mask))
 
     def set_ip_address(self, ip, mask):
         """为OLT设置带外管理IP地址
@@ -2084,14 +2195,12 @@ class OLTCLI_AN6K_17:
             ip (str): OLT IP地址
             mask (str): OLT 子网掩码
         """
-        validate_type('ip', ip, str)
-        validate_type('mask', mask, str)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('interface meth 1')
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('interface meth 1')
             try:
-                conn.run_cmd('ip address %s mask %s' % (ip, mask))
+                conn.run('ip address %s mask %s' % (ip, mask))
             except ConnectionResetError as cr:
                 logging.getLogger().debug('当调整OLT的管理IP时，会导致连接断开，这是正常的。需要约3秒恢复。')
 
@@ -2108,10 +2217,10 @@ class OLTCLI_AN6K_17:
         Returns:
             tuple: (ip, mask)组成的元组
         """
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('interface meth 1')
-            result = conn.run_cmd('show ip address')
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('interface meth 1')
+            result = conn.run('show ip address')
         
         return extract_ip_address(result)
 
@@ -2121,9 +2230,9 @@ class OLTCLI_AN6K_17:
         Returns:
             datetime: datetime类型的系统时间
         """
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            result = conn.run_cmd('show time')
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            result = conn.run('show time')
         
         date, time = extract_system_time(result)
 
@@ -2135,9 +2244,9 @@ class OLTCLI_AN6K_17:
         Returns:
             列表: 包含ONU授权信息的字典列表
         """
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            result = conn.run_cmd('show authorization')
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            result = conn.run('show authorization')
 
         return extract_authorization(result)
 
@@ -2153,7 +2262,7 @@ class OLTCLI_AN6K_17:
         Returns:
             tuple: 返回(slot, port)元组，如果查不到抛出异常
         """
-        validate_type('sn', sn, str)
+
        
         authInfo = self.get_authorization()
         for info in authInfo:
@@ -2179,12 +2288,11 @@ class OLTCLI_AN6K_17:
         Returns:
             datetime: 查不到ONUID抛异常。查到了，但是无最后一次上线时间(一般从未上线)，返回None。正常情况下，返回datetime格式的上线时间。
         """
-        validate_type('sn', sn, str)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('interface pon 1/%s/%s' % self.get_onu_position(sn))
-            result = conn.run_cmd('show onu last-reg-status-change %s' % self.get_onu_id(sn))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('interface pon 1/%s/%s' % self.get_onu_position(sn))
+            result = conn.run('show onu last-reg-status-change %s' % self.get_onu_id(sn))
         
         dictList = extract_last_reg_status_change(result)
 
@@ -2199,12 +2307,11 @@ class OLTCLI_AN6K_17:
         Returns:
             datetime: 查不到ONUID抛异常。查到了，但是无最后一次下线时间(一般从未下线)，返回None。正常情况下，返回datetime格式的最近一次的下线时间。
         """
-        validate_type('sn', sn, str)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('interface pon 1/%s/%s' % self.get_onu_position(sn))
-            result = conn.run_cmd('show onu last-reg-status-change %s' % self.get_onu_id(sn))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('interface pon 1/%s/%s' % self.get_onu_position(sn))
+            result = conn.run('show onu last-reg-status-change %s' % self.get_onu_id(sn))
         
         dictList = extract_last_reg_status_change(result)
 
@@ -2219,7 +2326,6 @@ class OLTCLI_AN6K_17:
         Returns:
             bool: True，在线；False，不在线。
         """
-        validate_type('sn', sn, str)
 
         values = self.get_authorization()
 
@@ -2240,16 +2346,14 @@ class OLTCLI_AN6K_17:
             sn (str): ONU SN号
             wait (bool, optional): 重置ONU后，等待重新上线。
         """
-        validate_type('sn', sn, str)
-        validate_type('wait', wait, bool)
 
         if not self.is_onu_online(sn):
             raise RuntimeWarning('无法重置离线状态下的ONU')
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('interface pon 1/%s/%s' % self.get_onu_position(sn))
-            conn.run_cmd('onu reset %s' % self.get_onu_id(sn))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('interface pon 1/%s/%s' % self.get_onu_position(sn))
+            conn.run('onu reset %s' % self.get_onu_id(sn))
         
         def isOffline():
             return not self.is_onu_online(sn)
@@ -2268,7 +2372,6 @@ class OLTCLI_AN6K_17:
         Args:
             wait (bool, optional): 重置ONU后，等待重新上线。
         """
-        validate_type('wait', wait, bool)
 
         # 获取所有在线的ONU对应的槽位号和端口号，以及下面挂的ONUID
         stats = { }
@@ -2282,12 +2385,12 @@ class OLTCLI_AN6K_17:
         
         # 重启这些个ONU
         for slotPort in stats.keys():
-            with Connection.get(self.olt_dev) as conn:
-                conn.run_cmd('config')
-                conn.run_cmd('interface pon 1/%s/%s' % slotPort)
+            with OLTTelnet(self.ip, self.username, self.password) as conn:
+                conn.run('config')
+                conn.run('interface pon 1/%s/%s' % slotPort)
                 # onu reset all命令存在bug，使用普通命令替代
                 for sn in stats[slotPort]:
-                    conn.run_cmd('onu reset %s' % self.get_onu_id(sn))
+                    conn.run('onu reset %s' % self.get_onu_id(sn))
                 
 
         # 等待下线
@@ -2314,19 +2417,19 @@ class OLTCLI_AN6K_17:
     def clear_whitelist(self):
         """清空所有授权
         """
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
             for wlMode in [ WhitelistMode.phyid, WhitelistMode.logid, WhitelistMode.password ]:
                 onuInfos = self.get_whitelist(wlMode)
                 for onuInfo in onuInfos:
                     if wlMode in [ WhitelistMode.phyid, WhitelistMode.phyid_psw ]:
-                        conn.run_cmd('no whitelist phy-id %s %s %s' % (onuInfo['Slot'], onuInfo['Pon'], onuInfo['Phy-ID']))
+                        conn.run('no whitelist phy-id %s %s %s' % (onuInfo['Slot'], onuInfo['Pon'], onuInfo['Phy-ID']))
                     
                     if wlMode in [ WhitelistMode.logid, WhitelistMode.logid_psw ]:
-                        conn.run_cmd('no whitelist logic-id %s %s %s' % (onuInfo['Slot'], onuInfo['Pon'], onuInfo['Logic-Id']))                       
+                        conn.run('no whitelist logic-id %s %s %s' % (onuInfo['Slot'], onuInfo['Pon'], onuInfo['Logic-Id']))                       
 
                     if wlMode in [ wlMode.password ]:
-                        conn.run_cmd('no whitelist password %s %s %s' % (onuInfo['Slot'], onuInfo['Pon'], onuInfo['Phy-Pwd']))
+                        conn.run('no whitelist password %s %s %s' % (onuInfo['Slot'], onuInfo['Pon'], onuInfo['Phy-Pwd']))
 
         # 验证
         for wlMode in [ WhitelistMode.phyid, WhitelistMode.logid, WhitelistMode.password ]:
@@ -2341,10 +2444,10 @@ class OLTCLI_AN6K_17:
             slot (int): 槽位号
             port (init): 端口号
         """
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('interface pon 1/%s/%s' % (slot, port))
-            conn.run_cmd('no whitelist %s' % 'all')
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('interface pon 1/%s/%s' % (slot, port))
+            conn.run('no whitelist %s' % 'all')
 
         for wlMode in [ WhitelistMode.phyid, WhitelistMode.logid, WhitelistMode.password ]:
             whiteList = self.get_pon_whitelist(slot, port, wlMode)
@@ -2362,14 +2465,11 @@ class OLTCLI_AN6K_17:
         Returns:
             list: 包含授权信息的列表
         """
-        validate_type('slot', slot, int)
-        validate_type('port', port, int)
-        validate_type('wlMode', wlMode, WhitelistMode)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('interface pon 1/%s/%s' % (slot, port))
-            result = conn.run_cmd('show whitelist %s' % get_whitelist_query_str(wlMode))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('interface pon 1/%s/%s' % (slot, port))
+            result = conn.run('show whitelist %s' % get_whitelist_query_str(wlMode))
         
         return extract_whitelist(result)
 
@@ -2382,11 +2482,10 @@ class OLTCLI_AN6K_17:
         Returns:
             list: 包含授权字典信息的列表
         """
-        validate_type('wlMode', wlMode, WhitelistMode)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            result = conn.run_cmd('show whitelist %s' % get_whitelist_query_str(wlMode))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            result = conn.run('show whitelist %s' % get_whitelist_query_str(wlMode))
 
         return extract_whitelist(result)
 
@@ -2400,10 +2499,8 @@ class OLTCLI_AN6K_17:
         Returns:
             bool: True，在白名单列表中；False，不在白名单列表中
         """
-        validate_type('wlMode', wlMode, WhitelistMode)
-        validate_type('sn', id, str)
 
-        id = value(id)
+        id = auto_convert(id)
 
         onuInfos = self.get_whitelist(wlMode)
         for onuInfo in onuInfos:
@@ -2448,11 +2545,6 @@ class OLTCLI_AN6K_17:
         # log-id / log-id + psw
         # 密码授权
         # psw
-        validate_type('wlMode', wlMode, WhitelistMode)
-        validate_type('sn', sn, str)
-        if onuId != None:
-            validate_type('onuid', onuId, int)
-
 
         # 配置所需的LogicId/Pwd, PhyId/Phy
         onuDetailInfo = None
@@ -2465,50 +2557,49 @@ class OLTCLI_AN6K_17:
         if onuDetailInfo == None:
             raise RuntimeWarning('未查到该ONU信息，无法进行有效配置')
 
-
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
             if wlMode == WhitelistMode.phyid:
                 if onuId == None:
-                    conn.run_cmd('whitelist add phy-id %s' % (onuDetailInfo['PhyId']))
+                    conn.run('whitelist add phy-id %s' % (onuDetailInfo['PhyId']))
                 else:
-                    conn.run_cmd('whitelist add phy-id %s onuid %s' % (onuDetailInfo['PhyId'], onuId))
+                    conn.run('whitelist add phy-id %s onuid %s' % (onuDetailInfo['PhyId'], onuId))
 
                 if not self.is_in_whitelist(wlMode, onuDetailInfo['PhyId']):
                     raise RuntimeWarning("白名单添加失败")
             
             if wlMode == WhitelistMode.phyid_psw:
                 if onuId == None:
-                    conn.run_cmd('whitelist add phy-id %s checkcode %s' % (onuDetailInfo['PhyId'], onuDetailInfo['PhyPwd']))
+                    conn.run('whitelist add phy-id %s checkcode %s' % (onuDetailInfo['PhyId'], onuDetailInfo['PhyPwd']))
                 else:
-                    conn.run_cmd('whitelist add phy-id %s checkcode %s onuid %s' % (onuDetailInfo['PhyId'], onuDetailInfo['PhyPwd'], onuId))
+                    conn.run('whitelist add phy-id %s checkcode %s onuid %s' % (onuDetailInfo['PhyId'], onuDetailInfo['PhyPwd'], onuId))
 
                 if not self.is_in_whitelist(wlMode, onuDetailInfo['PhyId']):
                     raise RuntimeWarning("白名单添加失败")
             
             if wlMode == WhitelistMode.logid:
                 if onuId == None:
-                    conn.run_cmd('whitelist add logic-id %s' % (onuDetailInfo['LogicId']))
+                    conn.run('whitelist add logic-id %s' % (onuDetailInfo['LogicId']))
                 else:
-                    conn.run_cmd('whitelist add logic-id %s onuid %s' % (onuDetailInfo['LogicId'], onuId))
+                    conn.run('whitelist add logic-id %s onuid %s' % (onuDetailInfo['LogicId'], onuId))
 
                 if not self.is_in_whitelist(wlMode, onuDetailInfo['LogicId']):
                     raise RuntimeWarning("白名单添加失败")
 
             if wlMode == WhitelistMode.logid_psw:
                 if onuId == None:
-                    conn.run_cmd('whitelist add logic-id %s checkcode %s' % (onuDetailInfo['LogicId'], onuDetailInfo['LogicPwd']))
+                    conn.run('whitelist add logic-id %s checkcode %s' % (onuDetailInfo['LogicId'], onuDetailInfo['LogicPwd']))
                 else:
-                    conn.run_cmd('whitelist add logic-id %s checkcode %s onuid %s' % (onuDetailInfo['LogicId'], onuDetailInfo['LogicPwd'], onuId))
+                    conn.run('whitelist add logic-id %s checkcode %s onuid %s' % (onuDetailInfo['LogicId'], onuDetailInfo['LogicPwd'], onuId))
 
                 if not self.is_in_whitelist(wlMode, onuDetailInfo['LogicId']):
                     raise RuntimeWarning("白名单添加失败")
 
             if wlMode == WhitelistMode.password:
                 if onuId == None:
-                    conn.run_cmd('whitelist add password %s' % (onuDetailInfo['PhyPwd']))
+                    conn.run('whitelist add password %s' % (onuDetailInfo['PhyPwd']))
                 else:
-                    conn.run_cmd('whitelist add password %s onuid %s' % (onuDetailInfo['PhyPwd'], onuId))
+                    conn.run('whitelist add password %s onuid %s' % (onuDetailInfo['PhyPwd'], onuId))
 
                 if not self.is_in_whitelist(wlMode, onuDetailInfo['PhyPwd']):
                     raise RuntimeWarning("白名单添加失败")   
@@ -2520,26 +2611,24 @@ class OLTCLI_AN6K_17:
             wlMode (Whitelist): 要从哪个白名单里面删除
             id (str): ONU的phyId、logId或passwd
         """
-        validate_type('wlMode', wlMode, WhitelistMode)
-        validate_type('sn', id, str)
 
         if not self.is_in_whitelist(wlMode, id):
             return
         
         onuInfos = self.get_whitelist(wlMode)
-        with Connection.get(self.olt_dev) as conn:
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
 
-            conn.run_cmd('config')
+            conn.run('config')
             
             for onuInfo in onuInfos:
                 if wlMode in [ WhitelistMode.phyid, WhitelistMode.phyid_psw ] and id == onuInfo['Phy-ID']:
-                    conn.run_cmd('no whitelist phy-id %s %s %s' % (onuInfo['Slot'], onuInfo['Pon'], id))
+                    conn.run('no whitelist phy-id %s %s %s' % (onuInfo['Slot'], onuInfo['Pon'], id))
                     
                 if wlMode in [ WhitelistMode.logid, WhitelistMode.logid_psw ] and id == onuInfo['Logic-Id']:
-                    conn.run_cmd('no whitelist logic-id %s %s %s' % (onuInfo['Slot'], onuInfo['Pon'], onuInfo['Logic-Id']))                       
+                    conn.run('no whitelist logic-id %s %s %s' % (onuInfo['Slot'], onuInfo['Pon'], onuInfo['Logic-Id']))                       
 
                 if wlMode in [ WhitelistMode.password ] and id == onuInfo['Phy-Pwd']:
-                    conn.run_cmd('no whitelist password %s %s %s' % (onuInfo['Slot'], onuInfo['Pon'], onuInfo['Phy-Pwd']))
+                    conn.run('no whitelist password %s %s %s' % (onuInfo['Slot'], onuInfo['Pon'], onuInfo['Phy-Pwd']))
 
         if self.is_in_whitelist(wlMode, id):
             raise RuntimeWarning('删除指定白名单中的ONU失败')
@@ -2563,9 +2652,9 @@ class OLTCLI_AN6K_17:
         Returns:
            list : 返回(slot, portNo, status, agingTime)元组组成的列表
         """
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            result = conn.run_cmd('show onu auto-discover 1/%s/%s' % (slot, port))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            result = conn.run('show onu auto-discover 1/%s/%s' % (slot, port))
 
         return extract_auto_discover(result)
 
@@ -2579,10 +2668,10 @@ class OLTCLI_AN6K_17:
         Returns:
             tuple: (status, agingTime)元组
         """
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('interface pon 1/%s/%s' % (slot, port))
-            result = conn.run_cmd('show onu auto-discover')
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('interface pon 1/%s/%s' % (slot, port))
+            result = conn.run('show onu auto-discover')
 
         return extract_pon_auto_discover(result)
 
@@ -2592,16 +2681,11 @@ class OLTCLI_AN6K_17:
         Args:
             where (str): <frameid/slotid/portid>或者'all'
             status (str): enable或者disable
-            agingTime (int): 发现时间
+            agingTime (int): 发现时间, 有效取值为0-3600
         """
-        validate_type('where', where, str)
-        validate_type('status', status, str)
-        validate_type('agingTime', agingTime, int)
-        validate_int_range(agingTime, 0, 3600)
-
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('onu auto-discover %s %s %s' % (where, status, agingTime))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('onu auto-discover %s %s %s' % (where, status, agingTime))
 
     def set_pon_auto_discover(self, slot, port, status, agingTime):
         """设置指定槽位号、端口号下的ONU自动发现设置。等同于执行onu auto-discover命令。
@@ -2612,16 +2696,11 @@ class OLTCLI_AN6K_17:
             status (str): enable或者disable
             agingTime (int): 发现时间
         """
-        validate_type('slot', slot, int)
-        validate_type('port', port, int)
-        validate_type('status', status, str)
-        validate_type('agingTime', agingTime, int)
-        validate_int_range('agingTime', 0, 3600)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('interface pon 1/%s/%s' % (slot, port))
-            conn.run_cmd('onu auto-discover %s %s' % (status, agingTime))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('interface pon 1/%s/%s' % (slot, port))
+            conn.run('onu auto-discover %s %s' % (status, agingTime))
 
     def get_discovery(self):
         """查询自动发现的ONU。等同于执行show discovery命令。
@@ -2630,9 +2709,9 @@ class OLTCLI_AN6K_17:
             list: 返回自动发现的ONU信息列表
         """
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            result = conn.run_cmd('show discovery')
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            result = conn.run('show discovery')
 
         ret = extract_discovery(result)
 
@@ -2648,10 +2727,10 @@ class OLTCLI_AN6K_17:
         Returns:
             list: 返回自动发现的ONU信息列表
         """
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('interface pon 1/%s/%s' % (slot, port))
-            result = conn.run_cmd('show onu discovered')
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('interface pon 1/%s/%s' % (slot, port))
+            result = conn.run('show onu discovered')
 
         ret = extract_discovery(result)
 
@@ -2666,9 +2745,9 @@ class OLTCLI_AN6K_17:
         Returns:
             list或dict: 包含管理VLAN信息字典的列表，或指定VLAN信息的字典。
         """
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            result = conn.run_cmd('show manage-vlan all')
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            result = conn.run('show manage-vlan all')
 
         vlanList = extract_manage_vlan(result)
         if name == None:
@@ -2687,13 +2766,10 @@ class OLTCLI_AN6K_17:
             port (int): 端口号
             mode (AuthMode): 授权模式
         """
-        validate_type('slot', slot, int)
-        validate_type('port', port, int)
-        validate_type('mode', mode, AuthMode)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('port authentication-mode 1/%s/%s mode %s' % (slot, port, mode.value))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('port authentication-mode 1/%s/%s mode %s' % (slot, port, mode.value))
         
         assert self.get_auth_mode(slot, port) == mode
     
@@ -2707,17 +2783,13 @@ class OLTCLI_AN6K_17:
         Returns:
             dict或AuthMode: 获取所有授权信息时，返回(slot, port)为键，AuthMode为值的字典。获取个别端口端口的授权模式时，返回AuthMode。 
         """
-        if (slot, port) != (None, None):
-            validate_type('slot', slot, int)
-            validate_type('port', port, int)
-
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
             if (slot, port) == (None, None):
-                result = conn.run_cmd('show port authentication-mode all')
+                result = conn.run('show port authentication-mode all')
                 return extract_port_authentication_mode(result)
             else: 
-                result = conn.run_cmd('show port authentication-mode select 1/%s/%s' % (slot, port))
+                result = conn.run('show port authentication-mode select 1/%s/%s' % (slot, port))
                 dictRet = extract_port_authentication_mode(result)
                 return dictRet[slot, port]
 
@@ -2728,12 +2800,10 @@ class OLTCLI_AN6K_17:
             option (DhcpOption): dhcp option选项
             enable (bool, optional): 是否打开。默认为True，打开。
         """
-        validate_type('option', option, DhcpOption)
-        validate_type('enable', enable, bool)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('dhcp %s %s' % (option.value, bool_to_str(enable)))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('dhcp %s %s' % (option.value, bool_to_str(enable)))
 
     def get_dhcp_option(self):
         """获取dhcp选项开关状态。等同于执行show dhcp state命令。
@@ -2741,9 +2811,9 @@ class OLTCLI_AN6K_17:
         Return:
             dict, 包含dhcp状态信息的字典。
         """
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            result = conn.run_cmd('show dhcp state')
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            result = conn.run('show dhcp state')
 
         ret = extract_dhcp_state(result)
 
@@ -2755,11 +2825,10 @@ class OLTCLI_AN6K_17:
         Args:
             enable (bool, optional): 默认为True，打开PPPoE+开关。
         """
-        validate_type('enable', enable, bool)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('pppoe-plus %s' % bool_to_str(enable))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('pppoe-plus %s' % bool_to_str(enable))
 
     def get_pppoe_plus(self):
         """获取PPPoE+选项状态。等同于执行show pppoe-plus state命令。
@@ -2767,9 +2836,9 @@ class OLTCLI_AN6K_17:
         return:
             bool: True使能， False未使能。
         """
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            result = conn.run_cmd('show pppoe-plus state')
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            result = conn.run('show pppoe-plus state')
         
         ret = extract_pppoe_plus(result)
     
@@ -2786,7 +2855,6 @@ class OLTCLI_AN6K_17:
         Return:
             str: 找到，返回ONU SN；没找到，返回None。
         """
-        validate_type('onuId', onuId, int)
 
         authList = self.get_authorization()
         for info in authList:
@@ -2804,7 +2872,6 @@ class OLTCLI_AN6K_17:
         Return:
             int : 找到返回ONU ID, 没找到，返回None。
         """
-        validate_type('sn', sn, str)
 
         authList = self.get_authorization()
         for info in authList:
@@ -2822,15 +2889,11 @@ class OLTCLI_AN6K_17:
             index (int): ONU Service 索引号
             tls (bool): 是否启用tls，True，启用，False，不启用
         """
-        validate_type('sn', sn, str)
-        validate_type('eth', eth, int)
-        validate_type('index', index, int)
-        validate_type('tls', tls, bool)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('interface pon 1/%s/%s' % self.get_onu_position(sn))
-            conn.run_cmd('onu port vlan %s eth %s service %s tls %s' % (self.get_onu_id(sn), eth, index, bool_to_str(tls)))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('interface pon 1/%s/%s' % self.get_onu_position(sn))
+            conn.run('onu port vlan %s eth %s service %s tls %s' % (self.get_onu_id(sn), eth, index, bool_to_str(tls)))
 
     def get_onu_port_vlan(self, sn):
         """读取ONU的Port Vlan业务设置。等同于执行命令show onu port vlan。
@@ -2841,12 +2904,12 @@ class OLTCLI_AN6K_17:
         Return:
             list : 元组列表。
         """
-        validate_type('sn', sn, str)
+
         
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('interface pon 1/%s/%s' % self.get_onu_position(sn))
-            result = conn.run_cmd('show onu port vlan %s' % self.get_onu_id(sn))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('interface pon 1/%s/%s' % self.get_onu_position(sn))
+            result = conn.run('show onu port vlan %s' % self.get_onu_id(sn))
         
         ret = extract_onu_port_vlan(result)
 
@@ -2861,16 +2924,15 @@ class OLTCLI_AN6K_17:
         Returns:
             list: 端口状态列表
         """
-        validate_type('sn', sn, str)
 
         if not self.is_onu_online(sn):
             raise RuntimeWarning('无法查询离线状态下的ONU端口状态')
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('terminal length 0')
-            conn.run_cmd('interface pon 1/%s/%s' % self.get_onu_position(sn))
-            result = conn.run_cmd('show onu port status %s' % self.get_onu_id(sn))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('terminal length 0')
+            conn.run('interface pon 1/%s/%s' % self.get_onu_position(sn))
+            result = conn.run('show onu port status %s' % self.get_onu_id(sn))
         
         ret = extract_onu_port_status(result)
 
@@ -2883,21 +2945,17 @@ class OLTCLI_AN6K_17:
             sn (str): ONU SN
             eth (str或int): 要清理的网口
         """
-        validate_type('sn', sn, str)
-        if eth != 'all':
-            validate_type('eth', eth, int)
-        
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('interface pon 1/%s/%s' % self.get_onu_position(sn))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('interface pon 1/%s/%s' % self.get_onu_position(sn))
             if eth == 'all':
                 if not self.is_onu_online(sn):
                     raise RuntimeWarning('ONU不在线，无法查询其端口数')
                 ethCount = len(self.get_onu_port_status(sn)['PORT'])
                 for eth in range(1, ethCount + 1):
-                    conn.run_cmd('no onu port vlan %s eth %s' % (self.get_onu_id(sn), eth))
+                    conn.run('no onu port vlan %s eth %s' % (self.get_onu_id(sn), eth))
             else:
-                conn.run_cmd('no onu port vlan %s eth %s' % (self.get_onu_id(sn), eth))
+                conn.run('no onu port vlan %s eth %s' % (self.get_onu_id(sn), eth))
 
     def get_onu_port_vlan_service_count(self, sn, eth):
         """获取ONU Port VLAN业务个数。
@@ -2909,9 +2967,6 @@ class OLTCLI_AN6K_17:
         Returns:
             int: 返回业务个数
         """
-        validate_type('sn', sn, str)
-        validate_type('eth', eth, int)
-
 
         portVlanList = self.get_onu_port_vlan(sn)
 
@@ -2935,14 +2990,11 @@ class OLTCLI_AN6K_17:
             eth (int): 要设置的ONU对应的网口
             count (int): 要设置的业务个数
         """
-        validate_type('sn', sn, str)
-        validate_type('eth', eth , int)
-        validate_type('count', count, int)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('interface pon 1/%s/%s' % self.get_onu_position(sn))
-            conn.run_cmd('onu port vlan %s eth %s service count %s' % (self.get_onu_id(sn), eth, count))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('interface pon 1/%s/%s' % self.get_onu_position(sn))
+            conn.run('onu port vlan %s eth %s service count %s' % (self.get_onu_id(sn), eth, count))
 
     def set_onu_port_vlan_service_type(self, sn, eth, index, type):
         """"设置ONU Port VLAN业务类型。等同于执行onu port vlan命令。
@@ -2953,15 +3005,11 @@ class OLTCLI_AN6K_17:
             index (int): 业务的索引值，从1开始。
             type (str): unicast，表示单播; multicast，表示多播。
         """
-        validate_type('sn', sn, str)
-        validate_type('eth', eth, int)
-        validate_type('index', index, int)
-        validate_type('type', type, str)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('interface pon 1/%s/%s' % self.get_onu_position(sn))
-            conn.run_cmd('onu port vlan %s eth %s service %s type %s' % (self.get_onu_id(sn), eth, index, type))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('interface pon 1/%s/%s' % self.get_onu_position(sn))
+            conn.run('onu port vlan %s eth %s service %s type %s' % (self.get_onu_id(sn), eth, index, type))
 
     def set_onu_port_vlan_service_vlan(self, sn, eth, index, rule):
         """设置ONU Port Vlan业务
@@ -2979,10 +3027,6 @@ class OLTCLI_AN6K_17:
             index (int): 业务的索引值，从1开始。
             rule (tuple): LAN业务参数， 以元组的方式提供。
         """
-        validate_type('sn', sn, str)
-        validate_type('eth', eth, int)
-        validate_type('index', index, int)
-        validate_type('rule', rule, tuple)
 
         # pvlan格式化模板
         pvlanFormat = '%s priority %s vid %s'
@@ -3019,10 +3063,10 @@ class OLTCLI_AN6K_17:
         else:
             raise ValueError('未知VLAN设置参数：%s' % str(rule))
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('interface pon 1/%s/%s' % self.get_onu_position(sn))
-            conn.run_cmd('onu port vlan %s eth %s service %s %s' % (self.get_onu_id(sn), eth, index, ruleString))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('interface pon 1/%s/%s' % self.get_onu_position(sn))
+            conn.run('onu port vlan %s eth %s service %s %s' % (self.get_onu_id(sn), eth, index, ruleString))
  
     def del_onu_port_vlan_service(self, sn, eth, index):
         """删除指定ONU下面指定网口的指定业务
@@ -3032,14 +3076,12 @@ class OLTCLI_AN6K_17:
             eth (int): 要删除的网口
             index (int): 要删除的业务ID
         """
-        validate_type('sn', sn, str)
-        validate_type('eth', eth, int)
-        validate_type('index', index, int)
+
         
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('interface pon 1/%s/%s' % self.get_onu_position(sn))
-            conn.run_cmd('no onu port vlan %s eth %s service %s' % (self.get_onu_id(sn), eth, index))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('interface pon 1/%s/%s' % self.get_onu_position(sn))
+            conn.run('no onu port vlan %s eth %s service %s' % (self.get_onu_id(sn), eth, index))
 
     def set_onu_port_vlan_service_classification(self, sn, eth, index, ruleList):
         """设置ONU端口业务区分规则
@@ -3050,18 +3092,14 @@ class OLTCLI_AN6K_17:
             index (int): 业务的索引值，从1开始。
             ruleList(list): 规则清单, (类型，操作，值，方向)元组组成的列表
         """
-        validate_type('sn', sn, str)
-        validate_type('eth', eth, int)
-        validate_type('index', index, int)
-        validate_type('ruleList', ruleList, list)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('interface pon 1/%s/%s' % self.get_onu_position(sn))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('interface pon 1/%s/%s' % self.get_onu_position(sn))
             for rule in ruleList:
                 type_, op_, value_, direction_ = rule
                 cmd2run = 'onu port vlan %s eth %s service %s %s %s %s %s' % (self.get_onu_id(sn), eth, index, direction_.value, type_.value, value_, op_.value)
-                conn.run_cmd(cmd2run)
+                conn.run(cmd2run)
 
     def set_igmp_vlan(self, vlan):
         """设置组播VLAN。等同于执行igmp vlan命令
@@ -3070,13 +3108,12 @@ class OLTCLI_AN6K_17:
             vlan (int或str): VLAN ID。str类型的会自动转换为int类型。
         """
         if type(vlan) == str:
-            vlan = value(vlan)
-        validate_type('vlan', vlan, int)
+            vlan = auto_convert(vlan)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('igmp')
-            conn.run_cmd('igmp vlan %s' % vlan)
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('igmp')
+            conn.run('igmp vlan %s' % vlan)
 
     def get_igmp_vlan(self, vlan):
         """获取组播VLAN设置。等同于执行命令show igmp vlan。
@@ -3088,14 +3125,13 @@ class OLTCLI_AN6K_17:
             dict: 组播VLAN信息字典。
         """
         if type(vlan) == str:
-            vlan = value(vlan)
+            vlan = auto_convert(vlan)
         
-        validate_type('vlan', vlan, int)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('igmp')
-            result = conn.run_cmd('show igmp vlan %s' % vlan)
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('igmp')
+            result = conn.run('show igmp vlan %s' % vlan)
 
         return extract_igmp_vlan(result)
 
@@ -3109,12 +3145,11 @@ class OLTCLI_AN6K_17:
         if type(mode) == str:
             mode = IGMPMode(mode)
         
-        validate_type('mode', mode, IGMPMode)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('igmp')
-            conn.run_cmd('igmp mode %s' % mode.value)
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('igmp')
+            conn.run('igmp mode %s' % mode.value)
         
         ret = self.get_igmp_mode()
         try:
@@ -3131,10 +3166,10 @@ class OLTCLI_AN6K_17:
             dict: 包含组播模式信息的字典。
         """
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('igmp')
-            result = conn.run_cmd('show igmp mode')
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('igmp')
+            result = conn.run('show igmp mode')
         
         ret = extract_igmp_mode_info(result)
         return ret
@@ -3150,16 +3185,12 @@ class OLTCLI_AN6K_17:
         """
         vlan = str(vlan)
 
-        validate_type('vlan', vlan, str)
-        validate_type('tag', tag, str)
-        validate_type('slot', slot, int)
-
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
             if slot == None and port == None and tag == None:
-                conn.run_cmd('port vlan %s allslot' % (vlan))
+                conn.run('port vlan %s allslot' % (vlan))
             else:
-                conn.run_cmd('port vlan %s %s 1/%s %s' % (vlan, tag, slot, port))        
+                conn.run('port vlan %s %s 1/%s %s' % (vlan, tag, slot, port))        
 
     def get_port_vlan(self, slot, port):
         """查询指定槽位和端口的Port VLAN信息。等同于执行show port vlan命令。
@@ -3171,12 +3202,10 @@ class OLTCLI_AN6K_17:
         Returns:
             list: 包含VLAN信息的元组列表。
         """
-        validate_type('slot', slot, int)
-        validate_type('port', port, int)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            result = conn.run_cmd('show port vlan 1/%s/%s' % (slot, port))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            result = conn.run('show port vlan 1/%s/%s' % (slot, port))
         
         return extract_port_vlan(result)
     
@@ -3189,14 +3218,10 @@ class OLTCLI_AN6K_17:
             port (str): 要设置的端口号。如，'2'，或'2, 3'。
         """
 
-        validate_type('vlan', vlan, str)
-        validate_type('slot', slot, int)
-
-
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
             try:
-                conn.run_cmd('no port vlan %s 1/%s %s' % (vlan, slot, port))
+                conn.run('no port vlan %s 1/%s %s' % (vlan, slot, port))
             except RuntimeWarning as rw:
                 logging.getLogger().debug('不存在该Port VLAN配置')
 
@@ -3339,15 +3364,15 @@ class OLTCLI_AN6K_17:
         
         wanCfgCMDPart4 = ' '
         if 'active' in kargs.keys():
-            validate_type('active', kargs['active'], str)
+
             wanCfgCMDPart4 = wanCfgCMDPart4 + 'active %s ' % kargs['active']
 
         if 'servicetype' in kargs.keys():
-            validate_type('servicetype', kargs['servicetype'], int)
+
             wanCfgCMDPart4 = wanCfgCMDPart4 + 'service-type %s ' % kargs['servicetype']
 
         if 'upnp' in kargs.keys():
-            validate_type('upnp', kargs['upnp'], str)
+
             wanCfgCMDPart4 = wanCfgCMDPart4 + 'upnp_switch %s ' % kargs['upnp']
         
         if 'fe' in kargs.keys() or 'ssid' in kargs.keys():
@@ -3366,10 +3391,10 @@ class OLTCLI_AN6K_17:
         
         cmd2Run = wanCfgCMDPart1 + wanCfgCMDPart2 + wanCfgCMDPart3 + wanCfgCMDPart4
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('interface pon 1/%s/%s' % self.get_onu_position(kargs['onuId']))
-            conn.run_cmd(cmd2Run)
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('interface pon 1/%s/%s' % self.get_onu_position(kargs['onuId']))
+            conn.run(cmd2Run)
 
     def get_onu_wan_cfg(self, sn, index):
         """读取指定ONU ID和WAN INDEX的配置。等同于执行命令show onu wan-cfg。
@@ -3381,14 +3406,12 @@ class OLTCLI_AN6K_17:
         Returns:
             dict: 包含配置信息的字典。字典的键名参考setONUWanCfg
         """
-        validate_type('sn', sn, str)
-        validate_type('index', index, int)
 
-        with Connection.get(self.olt_dev) as conn:
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
 
-            conn.run_cmd('config')
-            conn.run_cmd('interface pon 1/%s/%s' % self.get_onu_position(sn))
-            result = conn.run_cmd('show onu wan-cfg %s index %s' % (self.get_onu_id(sn), index))
+            conn.run('config')
+            conn.run('interface pon 1/%s/%s' % self.get_onu_position(sn))
+            result = conn.run('show onu wan-cfg %s index %s' % (self.get_onu_id(sn), index))
 
         return extract_wan_cfg(result)
 
@@ -3399,18 +3422,15 @@ class OLTCLI_AN6K_17:
             sn (str): 要删除的ONU SN
             index (int): 要删除的WAN index
         """
-        validate_type('sn', sn, str)
-        validate_type('index', index, int)
 
         # 检查要删除的wan配置是否存在
         wanCfgRet = self.get_onu_wan_cfg(sn, index)
         if None == wanCfgRet:
             return
 
-
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('interface pon 1/%s/%s' % self.get_onu_position(sn))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('interface pon 1/%s/%s' % self.get_onu_position(sn))
 
             wanCfg = wanCfgRet.copy()
             if len(wanCfg['fe']) != '0':
@@ -3421,7 +3441,7 @@ class OLTCLI_AN6K_17:
 
             self.set_onu_wan_cfg(**wanCfg)
 
-            conn.run_cmd('no onu wan-cfg %s index %s' % (self.get_onu_id(sn), index))
+            conn.run('no onu wan-cfg %s index %s' % (self.get_onu_id(sn), index))
 
     def get_onu_statistics(self, sn):
         """获取ONU统计信息。等同于执行命令show onu statistics。
@@ -3432,12 +3452,11 @@ class OLTCLI_AN6K_17:
         Returns:
             dict: 包含ONU统计信息的字典。
         """
-        validate_type('sn', sn, str)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('interface pon 1/%s/%s' % self.get_onu_position(sn))
-            result = conn.run_cmd('show onu statistics %s' % self.get_onu_id(sn))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('interface pon 1/%s/%s' % self.get_onu_position(sn))
+            result = conn.run('show onu statistics %s' % self.get_onu_id(sn))
         
         return extract_onu_statistics(result)
 
@@ -3452,21 +3471,15 @@ class OLTCLI_AN6K_17:
             dsCir (int): downstream committed information rate
             dsPir (int): downstream peak information rate
         """
-        validate_type('name', name, str)
-        validate_type('usCir', usCir, int)
-        validate_type('usPir', usPir, int)
-        validate_type('usFir', usFir, int)
-        validate_type('dsCir', dsCir, int)
-        validate_type('dsPir', dsPir, int)
 
         # bandwidth profile name should not exist
         assert self.query_bandwidth_profile_id_by_name(name) == None
 
         # add bandwidth profile
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            # conn.run_cmd('bandwidth-profile add %s upstream cir %s pir %s fir %s downstream cir %s pir %s' % (name, usCir, usPir, usFir, dsCir, dsPir))
-            conn.run_cmd('bandwidth-profile add %s upstream-pir %s downstream-pir %s upstream-cir %s downstream-cir %s upstream-fir %s' % (name, usPir, dsPir, usCir, dsCir, usFir))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            # conn.run('bandwidth-profile add %s upstream cir %s pir %s fir %s downstream cir %s pir %s' % (name, usCir, usPir, usFir, dsCir, dsPir))
+            conn.run('bandwidth-profile add %s upstream-pir %s downstream-pir %s upstream-cir %s downstream-cir %s upstream-fir %s' % (name, usPir, dsPir, usCir, dsCir, usFir))
 
         assert self.exist_bandwidth_profile(name, usCir, usPir, usFir, dsCir, dsPir)
 
@@ -3510,11 +3523,6 @@ class OLTCLI_AN6K_17:
         if type(nameOrId) != int and type(nameOrId) != str:
             raise RuntimeWarning('非法的nameOrId类型')
         
-        validate_type('usCir', usCir, int)
-        validate_type('usPir', usPir, int)
-        validate_type('usFir', usFir, int)
-        validate_type('dsCir', dsCir, int)
-        validate_type('dsPir', dsPir, int)
 
         profiles = self.get_bandwidth_profile()
 
@@ -3552,21 +3560,15 @@ class OLTCLI_AN6K_17:
         if type(nameOrId) != int and type(nameOrId) != str:
             raise RuntimeWarning('非法的nameOrId类型')
         
-        validate_type('usCir', usCir, int)
-        validate_type('usPir', usPir, int)
-        validate_type('usFir', usFir, int)
-        validate_type('dsCir', dsCir, int)
-        validate_type('dsPir', dsPir, int)
-
 
         if type(nameOrId) == int:
             nameOrId = 'id %s' % nameOrId
         else:   # type(nameOrId) == str
             nameOrId = 'name %s' % nameOrId
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('bandwidth-profile modify %s upstream cir %s pir %s fir %s downstream cir %s pir %s' % (nameOrId, usCir, usPir, usFir, dsCir, dsPir))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('bandwidth-profile modify %s upstream cir %s pir %s fir %s downstream cir %s pir %s' % (nameOrId, usCir, usPir, usFir, dsCir, dsPir))
         
         assert self.exist_bandwidth_profile(nameOrId, usCir, usPir, usFir, dsCir, dsPir)
 
@@ -3592,9 +3594,9 @@ class OLTCLI_AN6K_17:
             if prof['prfId'] == prfId:
                 self.clear_onu_bandwithd_profile(onu['Onu'])
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('bandwidth-profile delete %s' % (nameOrId))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('bandwidth-profile delete %s' % (nameOrId))
         
         assert self.not_exist_bandwidth_profile(nameOrId)
 
@@ -3612,9 +3614,9 @@ class OLTCLI_AN6K_17:
         else:
             assert type(id) == int
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            result = conn.run_cmd('show bandwidth-profile %s' % id)
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            result = conn.run('show bandwidth-profile %s' % id)
         
         ret = extract_bandwidth_profile(result)
 
@@ -3629,7 +3631,6 @@ class OLTCLI_AN6K_17:
         Returns:
             int: Bandwidth Profile的ID。查不到，返回None。
         """
-        validate_type('name', name, str)
 
         allProfiles = self.get_bandwidth_profile()
         for profile in allProfiles:
@@ -3656,20 +3657,19 @@ class OLTCLI_AN6K_17:
             sn (str): ONU SN
             profileIdOrName (int或str): 带宽模板的ID或者名称
         """
-        validate_type('sn', sn, str)
+
         assert type(profileIdOrName) == int or type(profileIdOrName) == str
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('interface pon 1/%s/%s' % self.get_onu_position(sn))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('interface pon 1/%s/%s' % self.get_onu_position(sn))
 
             if type(profileIdOrName) == int:
                 strProfile = 'profile-id %s' % profileIdOrName
             else:
                 strProfile = 'profile-name %s' % profileIdOrName
 
-            conn.run_cmd('onu bandwidth-profile %s %s' % (self.get_onu_id(sn), strProfile))
-
+            conn.run('onu bandwidth-profile %s %s' % (self.get_onu_id(sn), strProfile))
 
             if type(profileIdOrName) == str:
                 id = self.query_bandwidth_profile_id_by_name(profileIdOrName)
@@ -3689,7 +3689,6 @@ class OLTCLI_AN6K_17:
         Args:
             sn (str): 要取消模板关联的ONU SN
         """
-        validate_type('sn', sn, str)
 
         self.set_onu_bandwidth_profile(sn, 0)
 
@@ -3710,12 +3709,11 @@ class OLTCLI_AN6K_17:
         Returns:
             dict: 包含ONU所关联带宽模板的信息。
         """
-        validate_type('sn', sn, str)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('interface pon 1/%s/%s' % self.get_onu_position(sn))
-            result = conn.run_cmd('show onu bandwidth %s' % self.get_onu_id(sn))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('interface pon 1/%s/%s' % self.get_onu_position(sn))
+            result = conn.run('show onu bandwidth %s' % self.get_onu_id(sn))
         
         ret = extract_onu_bandwidth(result)
         ret['prfId'] = ret['prfId'] + 1
@@ -3732,16 +3730,11 @@ class OLTCLI_AN6K_17:
             usFir (int): upstream fix information rate
             dsPir (int): downstream peak information rate
         """
-        validate_type('sn', sn, str)
-        validate_type('usCir', usCir, int)
-        validate_type('usPir', usPir, int)
-        validate_type('usFir', usFir, int)
-        validate_type('dsPir', dsPir, int)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('interface pon 1/%s/%s' % self.get_onu_position(sn))
-            conn.run_cmd('onu bandwidth %s upstream-pir %s downstream-pir %s upstream-cir %s upstream-fir %s' % (self.get_onu_id(sn), usPir, dsPir, usCir, usFir))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('interface pon 1/%s/%s' % self.get_onu_position(sn))
+            conn.run('onu bandwidth %s upstream-pir %s downstream-pir %s upstream-cir %s upstream-fir %s' % (self.get_onu_id(sn), usPir, dsPir, usCir, usFir))
         
 
         ret = self.get_onu_bandwidth_profile(sn)
@@ -3765,19 +3758,15 @@ class OLTCLI_AN6K_17:
             usPir (int): 上行Pir
             dsPir (int): 下行Pir
         """
-        validate_type('slot', slot, int)
-        validate_type('port', port, int)
-        validate_type('usPir', usPir, int)
-        validate_type('dsPir', dsPir, int)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('interface pon 1/%s/%s' % (slot, port))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('interface pon 1/%s/%s' % (slot, port))
             if usPir != dsPir:
-                conn.run_cmd('bandwidth %s %s' % ('upstream', usPir))
-                conn.run_cmd('bandwidth %s %s' % ('downstream', dsPir))
+                conn.run('bandwidth %s %s' % ('upstream', usPir))
+                conn.run('bandwidth %s %s' % ('downstream', dsPir))
             else:
-                conn.run_cmd('bandwidth %s %s' % ('all', dsPir))
+                conn.run('bandwidth %s %s' % ('all', dsPir))
 
         ret = self.get_pon_bandwidth(slot, port)
         assert ret['UP'] == usPir and ret['DOWN'] == dsPir
@@ -3792,13 +3781,11 @@ class OLTCLI_AN6K_17:
         Returns:
             dict: 含带宽信息的字典。
         """
-        validate_type('slot', slot, int)
-        validate_type('port', port, int)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('interface pon 1/%s/%s' % (slot, port))
-            result =  conn.run_cmd('show bandwidth')
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('interface pon 1/%s/%s' % (slot, port))
+            result =  conn.run('show bandwidth')
         
         ret = extract_bandwidth(result)
 
@@ -3814,17 +3801,11 @@ class OLTCLI_AN6K_17:
             usProfileId (int): 上行带宽模板
             dsProfileId (int): 下行带宽模板
         """
-        validate_type('sn', sn, str)
-        validate_type('eth', eth, int)
-        validate_type('serviceIndex', serviceIndex, int)
-        validate_type('usProfileId', usProfileId, int)
-        validate_type('dsProfileId', dsProfileId, int)
 
-
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('interface pon 1/%s/%s' % self.get_onu_position(sn))
-            conn.run_cmd('onu port service-bandwith %s eth %s service %s upstream-profile %s downstream-profile %s' % (self.get_onu_id(sn), eth, serviceIndex, usProfileId, dsProfileId))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('interface pon 1/%s/%s' % self.get_onu_position(sn))
+            conn.run('onu port service-bandwith %s eth %s service %s upstream-profile %s downstream-profile %s' % (self.get_onu_id(sn), eth, serviceIndex, usProfileId, dsProfileId))
 
     def set_onu_port_policy(self, sn, eth, usEnable, usCir, usCbs, usEbs, dsEnable, dsCir, dsPir):
         """设置ONU端口策略。等同于执行onu port policing命令。
@@ -3840,20 +3821,11 @@ class OLTCLI_AN6K_17:
             dsCir (int): 下行CIR
             dsPir (int): 下行PIR
         """
-        validate_type('sn', sn, str)
-        validate_type('eth', eth, int)
-        validate_type('usEnable', usEnable, str)
-        validate_type('usCir', usCir, int)
-        validate_type('usCbs', usCbs, int)
-        validate_type('usEbs', usEbs, int)
-        validate_type('dsEnable', dsEnable, str)
-        validate_type('dsCir', dsCir, int)
-        validate_type('dsPir', dsPir, int)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('interface pon 1/%s/%s' % self.get_onu_position(sn))
-            conn.run_cmd('onu port policing %s eth %s upstream %s cir %s cbs %s ebs %s downstream %s cir %s pir %s' % (self.get_onu_id(sn), eth, usEnable, usCir, usCbs, usEbs, dsEnable, dsCir, dsPir))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('interface pon 1/%s/%s' % self.get_onu_position(sn))
+            conn.run('onu port policing %s eth %s upstream %s cir %s cbs %s ebs %s downstream %s cir %s pir %s' % (self.get_onu_id(sn), eth, usEnable, usCir, usCbs, usEbs, dsEnable, dsCir, dsPir))
 
     def set_onu_layer3_rate_limit(self, sn, wanIndex, usProfileId, dsProfileId):
         """设置ONU三层限速。等同于执行onu layer3-ratelimit-profile命令。
@@ -3864,15 +3836,11 @@ class OLTCLI_AN6K_17:
             usProfileId (int): 上行限速模板ProfileId
             dsProfileId (int): 下行限速模板ProfileId
         """
-        validate_type('sn', sn, str)
-        validate_type('wanIndex', wanIndex, int)
-        validate_type('usProfileId', usProfileId, int)
-        validate_type('dsProfileId', dsProfileId, int)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('interface pon 1/%s/%s' % self.get_onu_position(sn))
-            conn.run_cmd('onu layer3-ratelimit-profile %s %s upstream-profile-id %s downstream-profile-id %s' % (self.get_onu_id(sn), wanIndex, usProfileId, dsProfileId))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('interface pon 1/%s/%s' % self.get_onu_position(sn))
+            conn.run('onu layer3-ratelimit-profile %s %s upstream-profile-id %s downstream-profile-id %s' % (self.get_onu_id(sn), wanIndex, usProfileId, dsProfileId))
 
         found = False
         profiles = self.get_onu_layer3_rate_limit(sn)
@@ -3895,27 +3863,24 @@ class OLTCLI_AN6K_17:
         Returns:
             list: 包含限速信息的列表
         """
-        validate_type('sn', sn, str)
-        if state != None:
-            validate_type('state', state, str)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('interface pon 1/%s/%s' % self.get_onu_position(sn))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('interface pon 1/%s/%s' % self.get_onu_position(sn))
 
             onuId = self.get_onu_id(sn)
             if state == None:
                 
 
-                result1 = conn.run_cmd('show onu layer3-ratelimit-profile %s %s' % (onuId, 'offline'))
+                result1 = conn.run('show onu layer3-ratelimit-profile %s %s' % (onuId, 'offline'))
                 ret1 = extract_onu_layer3_rate_limit_profile(result1)
 
-                result2 = conn.run_cmd('show onu layer3-ratelimit-profile %s %s' % (onuId, 'online'))
+                result2 = conn.run('show onu layer3-ratelimit-profile %s %s' % (onuId, 'online'))
                 ret2 = extract_onu_layer3_rate_limit_profile(result2)
 
                 ret = ret1 + ret2
             else:
-                result = conn.run_cmd('show onu layer3-ratelimit-profile %s %s' % (onuId, state))
+                result = conn.run('show onu layer3-ratelimit-profile %s %s' % (onuId, state))
                 ret = extract_onu_layer3_rate_limit_profile(result)
         
         return ret
@@ -3927,8 +3892,7 @@ class OLTCLI_AN6K_17:
             sn (str): ONU SN
             wanIndex (int): WAN Index
         """
-        validate_type('sn', sn, str)
-        validate_type('wanIndex', wanIndex, int)
+
         self.set_onu_layer3_rate_limit(sn, wanIndex, -1, -1)
     
     def set_service_vlan(self, name, vlan, vlan_type):
@@ -3939,16 +3903,13 @@ class OLTCLI_AN6K_17:
             vlan (str): 业务VLAN范围。如 1000 - 2000， 或 1000。
             vlan_type (str): 业务VLAN类型。仅限'cnc', 'data', 'iptv', 'ngn', 'system', 'uplinksub', 'vod', 'voip'类型。
         """
-        validate_type('name', name, str)
-        validate_type('vlan', vlan, str)
-        validate_type('type', vlan_type, str)
 
         ValidTypesList = [ 'cnc', 'data', 'iptv', 'ngn', 'system', 'uplinksub', 'vod', 'voip']
         assert vlan_type in ValidTypesList, '无效的业务VLAN类型'
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('service-vlan %s %s type %s' % (name, vlan.replace('-', ' to '), vlan_type))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('service-vlan %s %s type %s' % (name, vlan.replace('-', ' to '), vlan_type))
 
         assert self.exist_service_vlan(name, vlan, vlan_type)
 
@@ -3959,9 +3920,9 @@ class OLTCLI_AN6K_17:
             list: 包含业务VLAN信息字典的列表。
         """
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            result = conn.run_cmd('show service-vlan')
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            result = conn.run('show service-vlan')
 
         return extract_service_vlan(result)
 
@@ -3971,14 +3932,13 @@ class OLTCLI_AN6K_17:
         Args:
             name (str): 业务VLAN的名称。
         """
-        validate_type('name', name, str)
 
         if not self.exist_service_vlan(name):
             return
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('no service-vlan %s' % name)
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('no service-vlan %s' % name)
         
         assert not self.exist_service_vlan(name)
 
@@ -4001,12 +3961,6 @@ class OLTCLI_AN6K_17:
         Returns:
             bool: True，所指定的业务VLAN，VLAN范围和类型存在; False，不存在。
         """
-        validate_type('name', name, str)
-        if vlan_range != None:
-            validate_type('vlan', vlan_range, str)
-        if service_type != None:
-            validate_type('type', service_type, str)
-
         svlanList = self.get_service_vlan()
         for svlanDict in svlanList:
             if svlanDict['name'] == name:
@@ -4035,8 +3989,6 @@ class OLTCLI_AN6K_17:
             name (str): Profile名称
             fieldValueOpList (list): (field, value, op)元组列表。如，[(0, '000000000000', 4)]。
         """
-        validate_type('name', name, str)
-        validate_type('fieldValueOpList', fieldValueOpList, list)
 
         if self.exist_onu_qinq_classification_profile(name):
             logging.getLogger().warning('名为%s的onuqinq-classification-profile已经存在，将会覆盖它' % name)
@@ -4050,8 +4002,7 @@ class OLTCLI_AN6K_17:
             name (str): Profile名称
             fieldValueOpList (list): (field, value, op)元组列表。如，[(0, '000000000000', 4)]。
         """
-        validate_type('name', name, str)
-        validate_type('fieldValueOpList', fieldValueOpList, list)
+
         
         assert self.exist_onu_qinq_classification_profile(name)
 
@@ -4065,18 +4016,16 @@ class OLTCLI_AN6K_17:
             fieldValueOpList (list): (field, value, op)元组列表。如，[(0, '000000000000', 4)]。
             op (str, optional): 默认为'add'，增加。还可以为'modify'。
         """
-        validate_type('name', name, str)
-        validate_type('fieldValueOpList', fieldValueOpList, list)
-        validate_type('op', op, str)
+
         
         fieldValueOpStr = ''
         for param in fieldValueOpList:
             fieldValueOpStr = fieldValueOpStr + ' %s %s %s' % param
         fieldValueOpStr = fieldValueOpStr.strip()
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('onuqinq-classification-profile %s %s %s' % (op, name, fieldValueOpStr))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('onuqinq-classification-profile %s %s %s' % (op, name, fieldValueOpStr))
         
         assert self.exist_onu_qinq_classification_profile(name)        
 
@@ -4089,17 +4038,15 @@ class OLTCLI_AN6K_17:
         Returns:
             list: 包含Profile信息字典的列表
         """
-        if name != None:
-            validate_type('name', name, str)
 
         if name:
             cmdStr = 'name %s' % name
         else:
             cmdStr = 'all'
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            result = conn.run_cmd('show onuqinq-classification-profile %s' % cmdStr)
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            result = conn.run('show onuqinq-classification-profile %s' % cmdStr)
         
         ret = extract_onu_qinq_classification_profile(result)
 
@@ -4111,14 +4058,13 @@ class OLTCLI_AN6K_17:
         Args:
             name (str): 要删除的Profile的名称
         """
-        validate_type('name', name, str)
 
         if not self.exist_onu_qinq_classification_profile(name):
             return
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('onuqinq-classification-profile delete %s' % name)
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('onuqinq-classification-profile delete %s' % name)
 
         assert not self.exist_onu_qinq_classification_profile(name)
 
@@ -4131,7 +4077,7 @@ class OLTCLI_AN6K_17:
         Returns:
             bool: True，存在；False，不存在。
         """
-        validate_type('name', name, str)
+
         
         profiles = self.get_onu_qinq_classification_profile()
 
@@ -4147,11 +4093,10 @@ class OLTCLI_AN6K_17:
         Args:
             name (str): oltqinq-domain的名称。
         """
-        validate_type('name', name, str)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('oltqinq-domain add %s' % name)
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('oltqinq-domain add %s' % name)
         
         # verify set successfully
         assert self.exist_olt_qinq_domain(name)
@@ -4172,9 +4117,9 @@ class OLTCLI_AN6K_17:
         else:
             strCmdArgs = "index %s" % nameOrIndex
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            result = conn.run_cmd('show oltqinq-domain %s' % strCmdArgs)
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            result = conn.run('show oltqinq-domain %s' % strCmdArgs)
 
         return extract_olt_qinq_domain(result)
 
@@ -4187,7 +4132,6 @@ class OLTCLI_AN6K_17:
         Return:
             bool: True，存在；False，不存在。
         """
-        validate_type('name', name, str)
 
         profile = self.get_olt_qinq_domain(name)
         if profile == None:
@@ -4202,12 +4146,11 @@ class OLTCLI_AN6K_17:
             name (str): 要设置的oltqinq-domain。
             count (int): 服务的数量。
         """
-        validate_type('name', name, str)
-        validate_type('count', count, int)
+
         
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('oltqinq-domain modify %s service-count %s' % (name, count))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('oltqinq-domain modify %s service-count %s' % (name, count))
         
         # verify
         profile = self.get_olt_qinq_domain(name)
@@ -4221,18 +4164,14 @@ class OLTCLI_AN6K_17:
             serviceIndex (int): 业务的索引号
             type (str): 业务的类型。
         """
-        validate_type('name', name, str)
-        validate_type('serviceIndex', serviceIndex, int)
-        validate_type('type', type, str)
-
 
         profile = self.get_olt_qinq_domain(name)
         assert profile != None, "oltqinq-domain不存在"
         assert serviceIndex <= profile['count'], "业务索引号(%s)超出范围, 仅有%s条业务。" % (serviceIndex, profile['count'])
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('oltqinq-domain modify %s service %s type %s' % (name, serviceIndex, type))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('oltqinq-domain modify %s service %s type %s' % (name, serviceIndex, type))
         
         # NEED VERIFY
         profile = self.get_olt_qinq_domain(name)
@@ -4248,14 +4187,13 @@ class OLTCLI_AN6K_17:
         Args:
             name (str): oltqinq-domain域名称。
         """
-        validate_type('name', name, str)
 
         if not self.exist_olt_qinq_domain(name):
             return
         
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('oltqinq-domain delete %s' % name)
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('oltqinq-domain delete %s' % name)
 
         # verify
         assert not self.exist_olt_qinq_domain(name)
@@ -4269,18 +4207,14 @@ class OLTCLI_AN6K_17:
             stream (str): 上行流还是下行流。上行，upstream；下行，downstream
             ruleList (list): (field-id, value, condition)形式的元组列表
         """
-        validate_type('name', name, str)
-        validate_type('serviceIndex', serviceIndex, int)
-        validate_type('stream', stream, str)
-        validate_type('ruleList', ruleList, list)
 
         # 将元组列表转换为字符串        
         strRule = list_to_str(ruleList, 'field-id %s value %s condition %s')
 
         # 执行命令
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('oltqinq-domain %s service %s classification %s %s' % (name, serviceIndex, stream, strRule))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('oltqinq-domain %s service %s classification %s %s' % (name, serviceIndex, stream, strRule))
 
         # 验证
         profile = self.get_olt_qinq_domain(name)
@@ -4304,17 +4238,14 @@ class OLTCLI_AN6K_17:
             serviceIndex (int): 业务类型
             vlanRuleList (list): vlan规则的元组列表。如，[(1, 'null', 'null', 'transparent', '33024', 'null', 'null')]。几个参数分别对应vlan层数，用户vid，用户cos，动作，目标tpid，目标cos和目标vid。            
         """
-        validate_type('name', name, str)
-        validate_type('serviceIndex', serviceIndex, int)
-        validate_type('vlanRuleList', vlanRuleList, list)
 
         # 将规则列表转换为字符串
         strVlanRule = list_to_str(vlanRuleList, 'vlan %s user-vlanid %s user-cos %s %s tpid %s cos %s vlanid %s')
 
         # run command
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('oltqinq-domain %s service %s %s' % (name, serviceIndex, strVlanRule))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('oltqinq-domain %s service %s %s' % (name, serviceIndex, strVlanRule))
 
         # verify
         profile = self.get_olt_qinq_domain(name)
@@ -4338,14 +4269,11 @@ class OLTCLI_AN6K_17:
             port (int): 要绑定的端口号
             name (str): 要绑定的QinQ域的名称
         """
-        validate_type('slot', slot, int)
-        validate_type('port', port, int)
-        validate_type('name', name, str)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('interface pon 1/%s/%s' % (slot, port))
-            conn.run_cmd('oltqinq-domain %s' % name)
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('interface pon 1/%s/%s' % (slot, port))
+            conn.run('oltqinq-domain %s' % name)
 
     def unbound_olt_qinq_domain(self, slot, port, name):
         """取消绑定oltqinq-domain。等同于执行no oltqinq-domain命令。
@@ -4355,17 +4283,14 @@ class OLTCLI_AN6K_17:
             port (int): 要取消绑定的端口号
             name (str): 要取消绑定的QinQ域的名称
         """
-        validate_type('slot', slot, int)
-        validate_type('port', port, int)
-        validate_type('name', name, str)
 
         if not self.is_olt_qinq_domain_bound(slot, port, name):
             return
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('interface pon 1/%s/%s' % (slot, port))
-            conn.run_cmd('no oltqinq-domain %s' % name)
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('interface pon 1/%s/%s' % (slot, port))
+            conn.run('no oltqinq-domain %s' % name)
 
     def is_olt_qinq_domain_bound(self, slot, port, name):
         """检查指定oltqinq-domain是否绑定。等同于执行show oltqinq-domain bound-info命令。
@@ -4377,17 +4302,14 @@ class OLTCLI_AN6K_17:
         Returns:
             bool: True, 绑定；Flase，未绑定。
         """
-        validate_type('slot', slot, int)
-        validate_type('port', port, int)
-        validate_type('name', name, str)
 
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            conn.run_cmd('interface pon 1/%s/%s' % (slot, port))
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            conn.run('interface pon 1/%s/%s' % (slot, port))
             try:
-                result = conn.run_cmd('show oltqinq-domain bound-info %s' % name)
+                result = conn.run('show oltqinq-domain bound-info %s' % name)
                 ret = extract_olt_qinq_domain_bound_info(result)
-                return ret == (value(slot), value(port))
+                return ret == (auto_convert(slot), auto_convert(port))
             except AssertionError as ae:
                 return False
 
@@ -4408,16 +4330,17 @@ class OLTCLI_AN6K_17:
     def get_current_alarm(self):
         """获取OLT上面当前产生的告警
         """
-        with Connection.get(self.olt_dev) as conn:
-            conn.run_cmd('config')
-            result = conn.run_cmd('show alarm current')
+        with OLTTelnet(self.ip, self.username, self.password) as conn:
+            conn.run('config')
+            result = conn.run('show alarm current')
         
         ret = extract_current_alarm(result)
 
         return ret
 
-
 __all__ = [
 
-    'OLTCLI_AN6K_17'
+    'OLTCLI_AN6K_17',
+    'OLTModel',
+    'OLTCLI'
 ]
