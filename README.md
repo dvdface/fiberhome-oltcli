@@ -25,13 +25,13 @@ With *fiberhome-oltcli* library, you can easily access olt's commandline interfa
 # How to use
 ## Use OLTCLI ###
 ```
-   oltcli = OLTCLI.get(OLTModel.AN6000_17, '10.182.33.210', 'GEPON', 'GEPON')
+   oltcli = OLTCLI.get(OLTModel.AN6000_17, '10.182.33.210', 'GPON', 'GPON')
 
    oltcli.get_authorization()
 ```
 ## Use OLTTelnet ###
 ```
-    telnet = OLTTelnet('10.182.33.210', 'GEPON', 'GEPON')
+    telnet = OLTTelnet('10.182.33.210', 'GPON', 'GPON')
     telnet.connect()
     assert telnet.run('config') == ''
     telnet.disconnect()
